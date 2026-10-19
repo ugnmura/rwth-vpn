@@ -55,7 +55,12 @@ have_vpnc_script() {
 pkg_install() {
     req=$1 extra=$2
     case "$PM" in
-        pacman) $ROOT pacman -S --needed --noconfirm $req;;
+        pacman)
+            # Only sync when there's no database at all (fresh container/install);
+            # a bare -Sy on a live system would mean a partial upgrade.
+            sy=-S
+            ls /var/lib/pacman/sync/*.db >/dev/null 2>&1 || sy=-Sy
+            $ROOT pacman $sy --needed --noconfirm $req;;
         apt) $ROOT apt-get update && $ROOT apt-get install -y $req;;
         dnf) $ROOT dnf install -y $req;;
         yum) $ROOT yum install -y $req;;

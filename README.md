@@ -25,7 +25,7 @@ The installer:
 
 | Platform | Package manager | Status |
 |---|---|---|
-| Arch / Manjaro | pacman | tested (aarch64) |
+| Arch / Manjaro | pacman | tested (Manjaro aarch64, Arch x86_64 container) |
 | Debian / Ubuntu | apt | installer tested in container |
 | Fedora | dnf | installer tested in container |
 | RHEL / Alma / Rocky | dnf/yum | needs EPEL for openconnect |
