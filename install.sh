@@ -154,14 +154,24 @@ fi
 
 say "Linking rwth-vpn into PATH"
 chmod +x "$REPO/rwth-vpn" "$REPO/lib/hook.sh"
-if [ -d /usr/local/bin ]; then
-    $ROOT ln -sf "$REPO/rwth-vpn" /usr/local/bin/rwth-vpn
-    echo "/usr/local/bin/rwth-vpn -> $REPO/rwth-vpn"
+# Prefer a directory already on PATH that needs no root (e.g. Homebrew's bin
+# on Apple Silicon, where /usr/local/bin may not exist).
+BIN=""
+for d in /usr/local/bin "$(have brew && brew --prefix)/bin"; do
+    [ -d "$d" ] && [ -w "$d" ] && { BIN=$d; break; }
+done
+if [ -n "$BIN" ]; then
+    ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
+elif [ -d /usr/local/bin ]; then
+    BIN=/usr/local/bin
+    $ROOT ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
 else
-    mkdir -p "$HOME/.local/bin"
-    ln -sf "$REPO/rwth-vpn" "$HOME/.local/bin/rwth-vpn"
-    echo "$HOME/.local/bin/rwth-vpn -> $REPO/rwth-vpn"
+    BIN=$HOME/.local/bin
+    mkdir -p "$BIN"
+    ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
+    case ":$PATH:" in *":$BIN:"*) ;; *) warn "$BIN is not on your PATH";; esac
 fi
+echo "$BIN/rwth-vpn -> $REPO/rwth-vpn"
 
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/config"
 if [ ! -e "$CFG" ]; then
