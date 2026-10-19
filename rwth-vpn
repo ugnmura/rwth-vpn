@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# rwth-vpn: connect to the RWTH Aachen VPN with openconnect, Tailscale-style.
+#
+#   rwth-vpn up [--split] [--user ab123456]   connect (prompts for VPN password + TOTP)
+#   rwth-vpn down                             disconnect
+#   rwth-vpn status                           show state
+#   rwth-vpn check                            test that the server still accepts openconnect
+#
+# Login runs as the invoking user; only the tunnel itself runs as root.
+# Nothing secret is stored: the session cookie is piped straight to openconnect.
+#
+# Portable to bash 3.2 (macOS) and the BSDs: no readlink -f, seq, getent ahostsv4
+# or empty "${arr[@]}" expansions under set -u.
+
+set -euo pipefail
+
+SERVER=vpn.rwth-aachen.de
+# The ASA answers 404 to any client whose User-Agent isn't "AnyConnect <OS> <ver>",
+# which is why stock openconnect fails with "Failed to complete authentication".
+AC_VERSION=5.1.6.103
+GROUP_FULL="RWTH-VPN (Full Tunnel)"
+GROUP_SPLIT="RWTH-VPN (Split Tunnel)"
+# RWTH IPv4 ranges, routed in --split mode in addition to what the server pushes.
+SPLIT_ROUTES="134.61.0.0/16 134.130.0.0/16 137.226.0.0/16"
+
+RUN_DIR=/var/run/rwth-vpn
+PID_FILE=$RUN_DIR/openconnect.pid
+STATE_FILE=$RUN_DIR/state
+LOG_FILE=/var/log/rwth-vpn.log
+
+resolve_self() {
+    local p=$1 l
+    while [ -L "$p" ]; do
+        l=$(readlink "$p")
+        case "$l" in /*) p=$l;; *) p=$(dirname "$p")/$l;; esac
+    done
+    echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+}
+SELF=$(resolve_self "$0")
+LIB_DIR=$(dirname "$SELF")/lib
+
+die() { echo "rwth-vpn: $*" >&2; exit 1; }
+is_root() { [ "$(id -u)" -eq 0 ]; }
+
+elevate_cmd() {
+    if command -v sudo >/dev/null 2>&1; then echo sudo
+    elif command -v doas >/dev/null 2>&1; then echo doas
+    else die "need root: install sudo or doas, or run as root"
+    fi
+}
+
+load_config() {
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/config"
+    # shellcheck disable=SC1090
+    [ -r "$cfg" ] && . "$cfg"
+    RWTH_USER=${RWTH_USER:-}
+    RWTH_MODE=${RWTH_MODE:-full}
+}
+
+UA_ARGS=(--useragent="AnyConnect Linux_64 $AC_VERSION" --version-string="$AC_VERSION" --os=linux-64)
+
+is_running() {
+    [ -r "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+find_vpnc_script() {
+    local p
+    # openconnect knows where its own distro put vpnc-script (incl. Nix store paths).
+    p=$(openconnect --help 2>&1 | sed -n 's/^ *default: "\(.*vpnc-script[^"]*\)".*/\1/p' | head -n 1)
+    [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return; }
+    for p in /etc/vpnc/vpnc-script /usr/share/vpnc-scripts/vpnc-script \
+             /usr/libexec/vpnc-scripts/vpnc-script /usr/local/etc/vpnc/vpnc-script \
+             /usr/local/sbin/vpnc-script /opt/homebrew/etc/vpnc/vpnc-script \
+             /opt/local/etc/vpnc/vpnc-script /usr/pkg/etc/vpnc/vpnc-script; do
+        [ -x "$p" ] && { echo "$p"; return; }
+    done
+    return 1
+}
+
+find_vpn_slice() {
+    local h p
+    command -v vpn-slice 2>/dev/null && return
+    for h in "${SUDO_USER_HOME:-}" "$HOME"; do
+        [ -n "$h" ] || continue
+        for p in "$h/.local/bin/vpn-slice" "$h/.local/share/uv/tools/vpn-slice/bin/vpn-slice" \
+                 "$h/.local/pipx/venvs/vpn-slice/bin/vpn-slice"; do
+            [ -x "$p" ] && { echo "$p"; return; }
+        done
+    done
+    return 1
+}
+
+# Resolve the gateway to IPv4 so the tunnel's own transport never depends on
+# IPv6, which full mode blocks while connected.
+gateway_ipv4() {
+    local ip=""
+    if command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahostsv4 "$SERVER" 2>/dev/null | awk 'NR==1{print $1}') || true
+    fi
+    if [ -z "$ip" ] && command -v dscacheutil >/dev/null 2>&1; then
+        ip=$(dscacheutil -q host -a name "$SERVER" | awk '/^ip_address:/{print $2; exit}')
+    fi
+    if [ -z "$ip" ] && command -v python3 >/dev/null 2>&1; then
+        ip=$(python3 -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "$SERVER" 2>/dev/null) || true
+    fi
+    if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
+        ip=$(host -t A "$SERVER" | awk '/has address/{print $NF; exit}')
+    fi
+    if [ -z "$ip" ] && command -v drill >/dev/null 2>&1; then
+        ip=$(drill "$SERVER" A | awk '$4=="A"{print $5; exit}')
+    fi
+    echo "$ip"
+}
+
+cmd_check() {
+    local out
+    out=$(openconnect --authenticate --non-inter "${UA_ARGS[@]}" "$SERVER" </dev/null 2>&1) || true
+    if echo "$out" | grep -q 'GROUP: \['; then
+        echo "ok: $SERVER offers the login form to openconnect"
+        echo "$out" | grep 'GROUP:' | sed 's/:\*\*\*$//'
+    else
+        echo "$out" >&2
+        die "server did not return a login form (User-Agent workaround may have stopped working)"
+    fi
+}
+
+cmd_up() {
+    local mode=$RWTH_MODE user=$RWTH_USER
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --split) mode="split";;
+            --full) mode="full";;
+            --user) user=${2:?--user needs a value}; shift;;
+            --user=*) user=${1#--user=};;
+            *) die "unknown option: $1";;
+        esac
+        shift
+    done
+    is_running && die "already connected (rwth-vpn down first)"
+    command -v openconnect >/dev/null || die "openconnect not installed (run install.sh)"
+    find_vpnc_script >/dev/null || die "vpnc-script not found (install your distro's vpnc-scripts package)"
+
+    local group=$GROUP_FULL
+    if [ "$mode" = split ]; then
+        group=$GROUP_SPLIT
+        find_vpn_slice >/dev/null || die "--split needs vpn-slice (run install.sh)"
+    fi
+
+    # Ask for the root password before the TOTP so the code doesn't expire meanwhile.
+    local el=""
+    if ! is_root; then
+        el=$(elevate_cmd)
+        if [ "$el" = sudo ]; then sudo -v; else doas true; fi || die "root is required to create the tunnel"
+    fi
+
+    local gw
+    gw=$(gateway_ipv4)
+    [ -n "$gw" ] || die "cannot resolve $SERVER"
+
+    local auth
+    echo "Logging in to $SERVER ($group). Enter your VPN password, then the TOTP code."
+    auth=$(openconnect --authenticate "${UA_ARGS[@]}" --resolve="$SERVER:$gw" \
+             --authgroup="$group" ${user:+--user="$user"} "$SERVER") \
+        || die "authentication failed"
+
+    local cookie url fp
+    cookie=$(printf '%s\n' "$auth" | sed -n "s/^COOKIE='\(.*\)'$/\1/p")
+    url=$(printf '%s\n' "$auth" | sed -n "s/^CONNECT_URL='\(.*\)'$/\1/p")
+    fp=$(printf '%s\n' "$auth" | sed -n "s/^FINGERPRINT='\(.*\)'$/\1/p")
+    [ -n "$cookie" ] && [ -n "$fp" ] || die "unexpected output from openconnect --authenticate"
+    [ -n "$url" ] || url="https://$SERVER/"
+
+    if is_root; then
+        printf '%s\n' "$cookie" | "$SELF" _connect "$mode" "$url" "$fp" "$SERVER:$gw"
+    else
+        printf '%s\n' "$cookie" | "$el" env SUDO_USER_HOME="$HOME" \
+            "$SELF" _connect "$mode" "$url" "$fp" "$SERVER:$gw"
+    fi
+}
+
+# Runs as root; reads the session cookie from stdin.
+cmd__connect() {
+    local mode=$1 url=$2 fp=$3 resolve=$4
+    is_root || die "_connect must run as root"
+    mkdir -p "$RUN_DIR"
+    chmod 755 "$RUN_DIR"
+
+    local vpnc
+    vpnc=$(find_vpnc_script) || die "vpnc-script not found"
+    export RWTH_VPN_MODE=$mode RWTH_VPN_VPNC_SCRIPT=$vpnc RWTH_VPN_STATE=$STATE_FILE
+    if [ "$mode" = split ]; then
+        RWTH_VPN_SLICE=$(find_vpn_slice) || die "vpn-slice not found"
+        export RWTH_VPN_SLICE RWTH_VPN_SPLIT_ROUTES=$SPLIT_ROUTES
+    fi
+
+    # A fixed name is nice on Linux; macOS needs utunN and the BSDs tunN, so let
+    # openconnect pick there.
+    local args=("${UA_ARGS[@]}" --cookie-on-stdin --servercert="$fp" --resolve="$resolve"
+                --script="$LIB_DIR/hook.sh" --background --pid-file="$PID_FILE" --timestamp)
+    [ "$(uname -s)" = Linux ] && args+=(--interface=tun-rwth)
+
+    printf '\n=== %s up (%s)\n' "$(date)" "$mode" >>"$LOG_FILE"
+    openconnect "${args[@]}" "$url" >>"$LOG_FILE" 2>&1 \
+        || { tail -n 20 "$LOG_FILE" >&2; die "tunnel failed (log: $LOG_FILE)"; }
+
+    # openconnect returns once the tunnel is up; give the hook a moment to finish.
+    sleep 1
+    cmd_status
+}
+
+cmd_down() {
+    is_running || { echo "not connected"; return 0; }
+    is_root || exec "$(elevate_cmd)" "$SELF" down
+    local pid n=0
+    pid=$(cat "$PID_FILE")
+    # SIGINT makes openconnect log off the session and run the disconnect hook.
+    kill -INT "$pid"
+    while kill -0 "$pid" 2>/dev/null && [ $n -lt 30 ]; do
+        sleep 0.5
+        n=$((n + 1))
+    done
+    kill -0 "$pid" 2>/dev/null && { kill -TERM "$pid"; sleep 1; }
+    rm -f "$PID_FILE"
+    echo "disconnected"
+}
+
+cmd_status() {
+    if ! is_running; then
+        echo "rwth-vpn: not connected"
+        return 1
+    fi
+    local MODE="" TUNDEV="" IP4="" IP6="" SINCE=""
+    # shellcheck disable=SC1090
+    [ -r "$STATE_FILE" ] && . "$STATE_FILE"
+    echo "rwth-vpn: connected (${MODE:-?} tunnel) since ${SINCE:-?}"
+    echo "  interface: ${TUNDEV:-?}  address: ${IP4:-?}${IP6:+  $IP6}"
+    if [ "${MODE:-}" = full ] && [ -z "${IP6:-}" ] && [ "$(uname -s)" = Linux ]; then
+        echo "  native IPv6 blocked while connected (VPN gave no IPv6)"
+    fi
+}
+
+usage() {
+    sed -n '2,10s/^# \{0,1\}//p' "$SELF"
+}
+
+main() {
+    local cmd=${1:-}
+    [ $# -gt 0 ] && shift
+    load_config
+    case "$cmd" in
+        up) cmd_up "$@";;
+        down) cmd_down;;
+        status) cmd_status;;
+        check) cmd_check;;
+        _connect) cmd__connect "$@";;
+        -h|--help|help|"") usage;;
+        *) usage; exit 2;;
+    esac
+}
+
+main "$@"
