@@ -30,6 +30,7 @@ TUNDEV='$TUNDEV'
 IP4='$INTERNAL_IP4_ADDRESS'
 IP6='${INTERNAL_IP6_ADDRESS:-}'
 SINCE='$(date '+%Y-%m-%d %H:%M')'
+V6_BLOCKED='${V6_BLOCKED:-}'
 EOF
 }
 
@@ -94,6 +95,7 @@ connect)
         ip -6 route add unreachable default table $V6_TABLE
         ip -6 rule add pref $PREF_V6_MAIN not fwmark $TS_MARK lookup main suppress_prefixlength 0
         ip -6 rule add pref $PREF_V6_BLOCK not fwmark $TS_MARK lookup $V6_TABLE
+        V6_BLOCKED=1
     fi
     write_state
     ;;

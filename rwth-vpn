@@ -5,9 +5,15 @@
 #   rwth-vpn down                             disconnect
 #   rwth-vpn status                           show state
 #   rwth-vpn check                            test that the server still accepts openconnect
+#   rwth-vpn secrets [--where]                store logins + TOTP secrets once, with links
+#                                             to where you get them (no more prompts)
+#   rwth-vpn test-login                       check the stored VPN secrets
+#   rwth-vpn ssh-setup                        make plain `ssh claix` work (no sudo, no prompts)
+#   rwth-vpn totp [hpc]                       print the current VPN (or HPC) TOTP code
 #
 # Login runs as the invoking user; only the tunnel itself runs as root.
-# Nothing secret is stored: the session cookie is piped straight to openconnect.
+# Secrets live only where `rwth-vpn secrets` puts them (Keychain / 0600 file);
+# the session cookie is piped straight to openconnect, never stored.
 #
 # Portable to bash 3.2 (macOS) and the BSDs: no readlink -f, seq, getent ahostsv4
 # or empty "${arr[@]}" expansions under set -u.
@@ -49,12 +55,59 @@ elevate_cmd() {
     fi
 }
 
+# shellcheck source=lib/secrets.sh
+. "$LIB_DIR/secrets.sh"
+
+# Rootless session for ssh: openconnect + ocproxy (userspace TCP/IP) exposing
+# the VPN as a SOCKS5 proxy. Per user, no root, no system routes touched.
+USER_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/rwth-vpn"
+PROXY_PID=$USER_DIR/proxy.pid
+PROXY_LOG=$USER_DIR/proxy.log
+SSH_CONF="$HOME/.ssh/rwth-vpn.conf"
+# After a failed automatic login, don't retry automatically for a while:
+# agents retrying in a loop would otherwise lock the token or account.
+VPN_FAIL_MARK=$USER_DIR/vpn-login-failed
+HPC_FAIL_MARK=$USER_DIR/hpc-login-failed
+BACKOFF_SECS=900
+
 load_config() {
     local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/config"
     # shellcheck disable=SC1090
     [ -r "$cfg" ] && . "$cfg"
-    RWTH_USER=${RWTH_USER:-}
+    RWTH_USER=${RWTH_USER:-$(secret_get user || true)}
     RWTH_MODE=${RWTH_MODE:-full}
+    RWTH_SOCKS_PORT=${RWTH_SOCKS_PORT:-11080}
+    # Overridable for testing against another AnyConnect server (e.g. ocserv).
+    SERVER=${RWTH_SERVER:-$SERVER}
+}
+
+find_ocproxy() {
+    command -v ocproxy 2>/dev/null && return
+    [ -x "$HOME/.local/bin/ocproxy" ] && { echo "$HOME/.local/bin/ocproxy"; return; }
+    return 1
+}
+
+# Log in and print openconnect's --authenticate output (COOKIE=..., etc.).
+# With stored secrets this needs no input: password and a fresh TOTP code are
+# piped in the order the ASA asks for them. Otherwise the user is prompted.
+authenticate() {
+    local group=$1 gw=$2 user=${3:-$RWTH_USER}
+    local args=("${UA_ARGS[@]}" --resolve="$SERVER:$gw" --authgroup="$group")
+    [ -n "$user" ] && args+=(--user="$user")
+    if [ -n "$user" ] && have_secret vpn_password && have_secret totp_secret; then
+        local code
+        code=$(secret_get totp_secret | python3 -I "$LIB_DIR/totp.py" --fresh) || die "cannot compute TOTP code"
+        { secret_get vpn_password; echo; echo "$code"; } |
+            openconnect --authenticate "${args[@]}" "$SERVER" 2>>"${AUTH_LOG:-/dev/null}"
+    else
+        echo "Logging in to $SERVER ($group). Enter your VPN password, then the TOTP code." >&2
+        echo "(Store them once with 'rwth-vpn secrets' to skip this.)" >&2
+        openconnect --authenticate "${args[@]}" "$SERVER"
+    fi
+}
+
+auth_field() {
+    printf '%s\n' "$1" | sed -n "s/^$2='\(.*\)'$/\1/p"
 }
 
 UA_ARGS=(--useragent="AnyConnect Linux_64 $AC_VERSION" --version-string="$AC_VERSION" --os=linux-64)
@@ -90,34 +143,38 @@ find_vpn_slice() {
     return 1
 }
 
-# Resolve the gateway to IPv4 so the tunnel's own transport never depends on
-# IPv6, which full mode blocks while connected.
-gateway_ipv4() {
-    local ip=""
-    if command -v getent >/dev/null 2>&1; then
-        ip=$(getent ahostsv4 "$SERVER" 2>/dev/null | awk 'NR==1{print $1}') || true
-    fi
-    if [ -z "$ip" ] && command -v dscacheutil >/dev/null 2>&1; then
-        ip=$(dscacheutil -q host -a name "$SERVER" | awk '/^ip_address:/{print $2; exit}')
-    fi
-    if [ -z "$ip" ] && command -v python3 >/dev/null 2>&1; then
-        ip=$(python3 -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "$SERVER" 2>/dev/null) || true
-    fi
-    if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
-        ip=$(host -t A "$SERVER" | awk '/has address/{print $NF; exit}')
-    fi
-    if [ -z "$ip" ] && command -v drill >/dev/null 2>&1; then
-        ip=$(drill "$SERVER" A | awk '$4=="A"{print $5; exit}')
-    fi
-    echo "$ip"
+# Pick the gateway address that actually answers on 443, IPv4 first. Pinning
+# it (--resolve) keeps the tunnel's own transport on that address; full mode's
+# IPv6 block exempts it via the host route vpnc-script adds. Falling back to
+# IPv6 matters: RWTH's ASA has been seen to stop answering a home IPv4 while
+# IPv6 still worked. Bounded, so an unreachable server fails in seconds.
+gateway_addr() {
+    python3 -I - "$SERVER" <<'PY' 2>/dev/null
+import socket, sys
+for fam in (socket.AF_INET, socket.AF_INET6):
+    try:
+        addrs = socket.getaddrinfo(sys.argv[1], 443, fam, socket.SOCK_STREAM)
+    except OSError:
+        continue
+    for *_, sa in addrs:
+        try:
+            socket.create_connection(sa[:2], timeout=4).close()
+        except OSError:
+            continue
+        print(sa[0])
+        sys.exit(0)
+sys.exit(1)
+PY
 }
 
 cmd_check() {
-    local out
-    out=$(openconnect --authenticate --non-inter "${UA_ARGS[@]}" "$SERVER" </dev/null 2>&1) || true
-    if echo "$out" | grep -q 'GROUP: \['; then
-        echo "ok: $SERVER offers the login form to openconnect"
-        echo "$out" | grep 'GROUP:' | sed 's/:\*\*\*$//'
+    local out gw
+    gw=$(gateway_addr) || die "$SERVER is unreachable on port 443 (IPv4 and IPv6)"
+    out=$(openconnect --authenticate --non-inter "${UA_ARGS[@]}" --resolve="$SERVER:$gw" "$SERVER" </dev/null 2>&1) || true
+    # The ASA labels it "GROUP:", ocserv "Group:".
+    if echo "$out" | grep -qi 'GROUP: \['; then
+        echo "ok: $SERVER ($gw) offers the login form to openconnect"
+        echo "$out" | grep -i 'GROUP:' | sed 's/:\*\*\*$//'
     else
         echo "$out" >&2
         die "server did not return a login form (User-Agent workaround may have stopped working)"
@@ -154,19 +211,19 @@ cmd_up() {
     fi
 
     local gw
-    gw=$(gateway_ipv4)
-    [ -n "$gw" ] || die "cannot resolve $SERVER"
+    gw=$(gateway_addr)
+    [ -n "$gw" ] || die "$SERVER is unreachable on port 443 (IPv4 and IPv6)"
+
+    # Only one RWTH session at a time: the ssh proxy session would compete.
+    proxy_stop
 
     local auth
-    echo "Logging in to $SERVER ($group). Enter your VPN password, then the TOTP code."
-    auth=$(openconnect --authenticate "${UA_ARGS[@]}" --resolve="$SERVER:$gw" \
-             --authgroup="$group" ${user:+--user="$user"} "$SERVER") \
-        || die "authentication failed"
+    auth=$(authenticate "$group" "$gw" "$user") || die "authentication failed"
 
     local cookie url fp
-    cookie=$(printf '%s\n' "$auth" | sed -n "s/^COOKIE='\(.*\)'$/\1/p")
-    url=$(printf '%s\n' "$auth" | sed -n "s/^CONNECT_URL='\(.*\)'$/\1/p")
-    fp=$(printf '%s\n' "$auth" | sed -n "s/^FINGERPRINT='\(.*\)'$/\1/p")
+    cookie=$(auth_field "$auth" COOKIE)
+    url=$(auth_field "$auth" CONNECT_URL)
+    fp=$(auth_field "$auth" FINGERPRINT)
     [ -n "$cookie" ] && [ -n "$fp" ] || die "unexpected output from openconnect --authenticate"
     [ -n "$url" ] || url="https://$SERVER/"
 
@@ -203,12 +260,334 @@ cmd__connect() {
     openconnect "${args[@]}" "$url" >>"$LOG_FILE" 2>&1 \
         || { tail -n 20 "$LOG_FILE" >&2; die "tunnel failed (log: $LOG_FILE)"; }
 
-    # openconnect returns once the tunnel is up; give the hook a moment to finish.
-    sleep 1
+    # openconnect backgrounds before it runs the hook; wait for the hook's state.
+    local n=0
+    while [ ! -r "$STATE_FILE" ] && [ $n -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
     cmd_status
 }
 
+# backoff_active MARK: true if MARK was written less than BACKOFF_SECS ago.
+backoff_active() {
+    local t
+    t=$(cat "$1" 2>/dev/null) || return 1
+    [ $(( $(date +%s) - ${t:-0} )) -lt "$BACKOFF_SECS" ]
+}
+
+backoff_msg() {
+    echo "rwth-vpn: automatic $1 login is paused for $((BACKOFF_SECS / 60)) min after a failed attempt" \
+         "($(date -r "$2" '+%H:%M' 2>/dev/null || echo recently)), to protect your account from lockout." >&2
+    echo "  Fix the secrets with 'rwth-vpn secrets' (this also resumes logins)." >&2
+}
+
+proxy_running() {
+    [ -r "$PROXY_PID" ] && kill -0 "$(cat "$PROXY_PID")" 2>/dev/null
+}
+
+# ssh masters ride on the VPN session; once it's gone they only hang around.
+masters_stop() {
+    local s
+    for s in "$HOME"/.ssh/rwth-vpn-cm/*; do
+        [ -S "$s" ] && ssh -o ControlPath="$s" -O exit rwth-vpn-master >/dev/null 2>&1
+    done
+    return 0
+}
+
+proxy_stop() {
+    proxy_running || return 0
+    masters_stop
+    local pid n=0
+    pid=$(cat "$PROXY_PID")
+    kill -INT "$pid"
+    while kill -0 "$pid" 2>/dev/null && [ $n -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
+    kill -0 "$pid" 2>/dev/null && kill -TERM "$pid"
+    rm -f "$PROXY_PID"
+}
+
+port_open() {
+    python3 -I -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 2).close()' "$1" 2>/dev/null
+}
+
+# Start the rootless session unless it's already up. Non-interactive when
+# secrets are stored; serialised so parallel ssh calls (agents) share one.
+proxy_ensure() {
+    proxy_running && port_open "$RWTH_SOCKS_PORT" && return 0
+    local ocproxy gw lock=$USER_DIR/proxy.lock
+    ocproxy=$(find_ocproxy) || die "ocproxy not installed (run install.sh)"
+    mkdir -p "$USER_DIR" && chmod 700 "$USER_DIR"
+
+    local n=0
+    until mkdir "$lock" 2>/dev/null; do
+        # Another process is connecting; wait for it, but break stale locks.
+        [ $n -ge 120 ] && { rm -rf "$lock"; continue; }
+        sleep 0.5; n=$((n + 1))
+        proxy_running && port_open "$RWTH_SOCKS_PORT" && return 0
+    done
+    # shellcheck disable=SC2064
+    trap "rm -rf '$lock'" EXIT
+
+    proxy_stop
+    if backoff_active "$VPN_FAIL_MARK"; then
+        backoff_msg VPN "$VPN_FAIL_MARK"
+        exit 1
+    fi
+    gw=$(gateway_addr)
+    [ -n "$gw" ] || die "$SERVER is unreachable on port 443 (IPv4 and IPv6)"
+    local auth cookie url fp
+    printf '\n=== %s proxy up\n' "$(date)" >>"$PROXY_LOG"
+    auth=$(AUTH_LOG=$PROXY_LOG authenticate "$GROUP_FULL" "$gw" </dev/null) || auth=""
+    cookie=$(auth_field "$auth" COOKIE)
+    url=$(auth_field "$auth" CONNECT_URL)
+    fp=$(auth_field "$auth" FINGERPRINT)
+    if [ -z "$cookie" ]; then
+        date +%s >"$VPN_FAIL_MARK"
+        die "VPN login failed (see $PROXY_LOG); check with 'rwth-vpn test-login'"
+    fi
+    rm -f "$VPN_FAIL_MARK"
+
+    printf '%s\n' "$cookie" | openconnect "${UA_ARGS[@]}" --cookie-on-stdin \
+        --servercert="$fp" --resolve="$SERVER:$gw" \
+        --script-tun --script="$ocproxy -D $RWTH_SOCKS_PORT -k 60" \
+        --background --pid-file="$PROXY_PID" --timestamp \
+        "${url:-https://$SERVER/}" >>"$PROXY_LOG" 2>&1 \
+        || die "VPN tunnel failed (see $PROXY_LOG)"
+    n=0
+    until port_open "$RWTH_SOCKS_PORT"; do
+        [ $n -ge 40 ] && die "SOCKS proxy did not come up (see $PROXY_LOG)"
+        sleep 0.25; n=$((n + 1))
+    done
+}
+
+# ssh ProxyCommand: use the system tunnel if it's up, else the proxy session.
+cmd__ssh_proxy() {
+    local host=$1 port=$2
+    if is_running; then
+        exec python3 -I "$LIB_DIR/connect.py" "$host" "$port"
+    fi
+    # Subshell: its EXIT trap must drop the lock before exec replaces us.
+    (proxy_ensure) >&2
+    exec python3 -I "$LIB_DIR/connect.py" "$host" "$port" "$RWTH_SOCKS_PORT"
+}
+
+# ssh `Match exec` hook: make sure a logged-in master connection exists for
+# this host, so the actual ssh (yours or an agent's) needs no prompts at all.
+# Always succeeds: on failure, ssh just falls back to normal interactive auth.
+cmd__ssh_master() {
+    local host=$1
+    # Our own ssh calls below re-read the config; don't recurse.
+    [ -n "${RWTH_VPN_SSH_INNER:-}" ] && return 0
+    export RWTH_VPN_SSH_INNER=1
+    if ssh -O check "$host" >/dev/null 2>&1; then
+        { is_running || proxy_running; } && return 0
+        # The VPN session under this master is gone (down, timeout): replace it.
+        ssh -O exit "$host" >/dev/null 2>&1 || true
+    fi
+    have_secret hpc_password || return 0
+    # ssh discards the ProxyCommand's stderr when ControlMaster is set, so
+    # VPN login trouble is reported from here.
+    if ! is_running && backoff_active "$VPN_FAIL_MARK"; then
+        backoff_msg VPN "$VPN_FAIL_MARK"
+        return 0
+    fi
+    # Paused after a failed login: skip, so a human gets normal prompts and an
+    # agent (BatchMode) fails without another attempt against the account.
+    if backoff_active "$HPC_FAIL_MARK"; then
+        backoff_msg HPC "$HPC_FAIL_MARK"
+        return 0
+    fi
+
+    mkdir -p "$USER_DIR" && chmod 700 "$USER_DIR"
+    local lock n=0
+    lock=$USER_DIR/master.$(printf '%s' "$host" | tr -c 'A-Za-z0-9.-' _).lock
+    until mkdir "$lock" 2>/dev/null; do
+        [ $n -ge 120 ] && { rm -rf "$lock"; continue; }
+        sleep 0.5; n=$((n + 1))
+        ssh -O check "$host" >/dev/null 2>&1 && return 0
+    done
+    # shellcheck disable=SC2064
+    trap "rm -rf '$lock'" EXIT
+    ssh -O check "$host" >/dev/null 2>&1 && return 0
+
+    # SSH_ASKPASS_REQUIRE=force (OpenSSH >= 8.4) routes every prompt
+    # (password, TOTP) to our helper even with a terminal attached. One try:
+    # repeating the same stored answers only counts towards a lockout.
+    # Output goes to a file, not $(...): the backgrounded master (-f) would
+    # hold a pipe open for its whole lifetime.
+    local out tmp=$USER_DIR/master.out.$$
+    SSH_ASKPASS="$LIB_DIR/askpass.sh" SSH_ASKPASS_REQUIRE=force DISPLAY=${DISPLAY:-:0} \
+        ssh -f -N -M -o BatchMode=no -o NumberOfPasswordPrompts=1 "$host" \
+        </dev/null >"$tmp" 2>&1 || true
+    out=$(cat "$tmp"); rm -f "$tmp"
+    printf '=== %s master %s\n%s\n' "$(date)" "$host" "$out" >>"$USER_DIR/ssh.log"
+    if ssh -O check "$host" >/dev/null 2>&1; then
+        rm -f "$HPC_FAIL_MARK"
+    elif printf '%s' "$out" | grep -q 'Permission denied'; then
+        # Only a rejected login pauses retries; network trouble doesn't.
+        date +%s >"$HPC_FAIL_MARK"
+        echo "rwth-vpn: HPC login rejected (see $USER_DIR/ssh.log); check 'rwth-vpn secrets'" >&2
+    elif ! backoff_active "$VPN_FAIL_MARK"; then
+        echo "rwth-vpn: could not reach $host (see $USER_DIR/ssh.log)" >&2
+    else
+        echo "rwth-vpn: VPN login failed (see $PROXY_LOG); check with 'rwth-vpn test-login'" >&2
+    fi
+    return 0
+}
+
+cmd_ssh_setup() {
+    local hpc_user=${RWTH_HPC_USER:-$(secret_get hpc_user || true)}
+    hpc_user=${hpc_user:-$RWTH_USER}
+    mkdir -p "$HOME/.ssh/rwth-vpn-cm" && chmod 700 "$HOME/.ssh" "$HOME/.ssh/rwth-vpn-cm"
+    cat >"$SSH_CONF" <<EOF
+# Generated by 'rwth-vpn ssh-setup'. RWTH HPC (CLAIX) through the RWTH VPN,
+# logging in with stored secrets so plain ssh/scp/rsync need no prompts.
+
+Host claix
+    HostName login23-1.hpc.itc.rwth-aachen.de
+Host login23-* copy23-*
+    HostName %h.hpc.itc.rwth-aachen.de
+
+Match originalhost "claix,login23-*,copy23-*,*.hpc.itc.rwth-aachen.de" exec "'$SELF' _ssh-master %n"
+${hpc_user:+    User $hpc_user
+}    ProxyCommand '$SELF' _ssh-proxy %h %p
+    ControlMaster auto
+    ControlPath ~/.ssh/rwth-vpn-cm/%C
+    ControlPersist 8h
+    ServerAliveInterval 60
+    StrictHostKeyChecking accept-new
+EOF
+    local cfg=$HOME/.ssh/config line="Include $SSH_CONF"
+    touch "$cfg"
+    if ! grep -qxF "$line" "$cfg"; then
+        # Include must come before any Host block to apply to every host.
+        { echo "$line"; echo; cat "$cfg"; } >"$cfg.rwth-vpn.tmp" && mv "$cfg.rwth-vpn.tmp" "$cfg"
+        chmod 600 "$cfg"
+        echo "added '$line' to the top of $cfg"
+    fi
+    echo "wrote $SSH_CONF"
+}
+
+IDM_URL=https://idm.rwth-aachen.de/selfservice/
+REGAPP_URL=https://regapp.itc.rwth-aachen.de/
+VPN_HELP_URL=https://help.itc.rwth-aachen.de/en/service/vbf6fx0gom76/article/34c748946f63455090ede2dd5a7a49e5
+HPC_HELP_URL=https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/fb61d6c86ae245b5b7bba8c0cb7db6eb/
+
+secrets_guide_vpn() {
+    cat <<EOF
+VPN, needed for everything. Both come from IdM Selfservice:
+  $IDM_URL
+  - VPN password: set it there. It is NOT your RWTH single sign-on password.
+  - TOTP secret: Token Manager -> new token -> "Authenticator app (TOTP)".
+    Copy the secret text shown with the QR code (or the otpauth:// link).
+    Also scan the QR code with your phone, so you can still log in by hand.
+    Keep SHA1 / 6 digits, or paste the otpauth:// link, which carries them.
+  Guide: $VPN_HELP_URL
+EOF
+}
+
+secrets_guide_hpc() {
+    cat <<EOF
+HPC (CLAIX), only for ssh. The HPC has its own password and its own TOTP
+tokens, both in RegApp:
+  $REGAPP_URL
+  - HPC password: your HPC account's password (not the VPN one).
+  - HPC TOTP secret: set up a TOTP second factor there and copy its secret
+    the same way as above.
+  Guide: $HPC_HELP_URL
+EOF
+}
+
+# prompt_secret NAME LABEL HIDDEN [DEFAULT_NOTE]
+prompt_secret() {
+    local name=$1 label=$2 hidden=$3 note=${4:-unset} cur v
+    cur=$(secret_get "$name" || true)
+    while :; do
+        if [ "$hidden" = 1 ]; then
+            printf '  %s [%s]: ' "$label" "$([ -n "$cur" ] && echo set || echo "$note")"
+            stty -echo; IFS= read -r v || true; stty echo; echo
+        else
+            printf '  %s [%s]: ' "$label" "${cur:-$note}"
+            IFS= read -r v || true
+        fi
+        case "$v" in
+            "") return 0;;
+            -) secret_set "$name" ""; echo "    deleted"; return 0;;
+        esac
+        case "$name" in
+            *totp_secret)
+                if ! printf '%s' "$v" | python3 -I "$LIB_DIR/totp.py" >/dev/null 2>&1; then
+                    echo "    That isn't a base32 secret or otpauth:// link; try again ('-' to delete)."
+                    continue
+                fi
+                secret_set "$name" "$v"
+                echo "    Current code: $(printf '%s' "$v" | python3 -I "$LIB_DIR/totp.py")  <- should match your phone"
+                ;;
+            *) secret_set "$name" "$v";;
+        esac
+        return 0
+    done
+}
+
+cmd_secrets() {
+    case "${1:-}" in
+        --where|--help|-h)
+            secrets_guide_vpn; echo; secrets_guide_hpc
+            echo; echo "Run 'rwth-vpn secrets' in a terminal to enter them."
+            return 0;;
+    esac
+    [ -t 0 ] || { secrets_guide_vpn; echo; secrets_guide_hpc; die "run 'rwth-vpn secrets' in a terminal to enter them"; }
+
+    echo "Secrets are stored in $( [ "$(secret_backend)" = keychain ] && echo "your macOS Keychain (service rwth-vpn)" || echo "$SECRETS_FILE (mode 0600)")."
+    echo "Enter keeps the current value, '-' deletes it. Typing is hidden for passwords and secrets."
+    echo
+    secrets_guide_vpn
+    prompt_secret user "RWTH username, e.g. ab123456" 0
+    prompt_secret vpn_password "VPN password" 1
+    prompt_secret totp_secret "VPN TOTP secret" 1
+    echo
+    secrets_guide_hpc
+    prompt_secret hpc_user "HPC username" 0 "same as RWTH"
+    prompt_secret hpc_password "HPC password" 1
+    prompt_secret hpc_totp_secret "HPC TOTP secret" 1
+
+    echo
+    if have_secret user && have_secret vpn_password && have_secret totp_secret; then
+        printf 'Test the VPN login now? [Y/n] '
+        local ans; read -r ans || ans=n
+        case "$ans" in
+            [Nn]*) ;;
+            *) cmd_test_login;;
+        esac
+    else
+        echo "VPN secrets incomplete: logins will prompt for what's missing."
+    fi
+    rm -f "$VPN_FAIL_MARK" "$HPC_FAIL_MARK"
+    [ -r "$SSH_CONF" ] || cmd_ssh_setup >/dev/null
+    have_secret hpc_password && echo "Next: ssh claix hostname"
+}
+
+# Log in without starting a tunnel, to check the stored secrets.
+cmd_test_login() {
+    local gw out
+    gw=$(gateway_addr)
+    [ -n "$gw" ] || die "$SERVER is unreachable on port 443 (IPv4 and IPv6)"
+    if out=$(AUTH_LOG=/dev/stderr authenticate "$GROUP_FULL" "$gw" </dev/null 2>&1) &&
+        [ -n "$(auth_field "$out" COOKIE)" ]; then
+        rm -f "$VPN_FAIL_MARK"
+        echo "ok: VPN login works"
+    else
+        printf '%s\n' "$out" | grep -v '^COOKIE=' | tail -n 8 >&2
+        die "VPN login failed: check username, VPN password and TOTP secret ('rwth-vpn secrets')"
+    fi
+}
+
+cmd_totp() {
+    local name=totp_secret
+    [ "${1:-}" = hpc ] && name=hpc_totp_secret
+    have_secret "$name" || die "no ${1:+HPC }TOTP secret stored (run 'rwth-vpn secrets')"
+    secret_get "$name" | python3 -I "$LIB_DIR/totp.py"
+}
+
 cmd_down() {
+    proxy_running && { proxy_stop; echo "ssh proxy session stopped"; }
     is_running || { echo "not connected"; return 0; }
     is_root || exec "$(elevate_cmd)" "$SELF" down
     local pid n=0
@@ -225,22 +604,25 @@ cmd_down() {
 }
 
 cmd_status() {
+    if proxy_running; then
+        echo "ssh proxy session: up (SOCKS5 127.0.0.1:$RWTH_SOCKS_PORT, pid $(cat "$PROXY_PID"))"
+    fi
     if ! is_running; then
         echo "rwth-vpn: not connected"
         return 1
     fi
-    local MODE="" TUNDEV="" IP4="" IP6="" SINCE=""
+    local MODE="" TUNDEV="" IP4="" IP6="" SINCE="" V6_BLOCKED=""
     # shellcheck disable=SC1090
     [ -r "$STATE_FILE" ] && . "$STATE_FILE"
     echo "rwth-vpn: connected (${MODE:-?} tunnel) since ${SINCE:-?}"
     echo "  interface: ${TUNDEV:-?}  address: ${IP4:-?}${IP6:+  $IP6}"
-    if [ "${MODE:-}" = full ] && [ -z "${IP6:-}" ] && [ "$(uname -s)" = Linux ]; then
+    if [ "${V6_BLOCKED:-}" = 1 ]; then
         echo "  native IPv6 blocked while connected (VPN gave no IPv6)"
     fi
 }
 
 usage() {
-    sed -n '2,10s/^# \{0,1\}//p' "$SELF"
+    sed -n '2,16s/^# \{0,1\}//p' "$SELF"
 }
 
 main() {
@@ -252,7 +634,13 @@ main() {
         down) cmd_down;;
         status) cmd_status;;
         check) cmd_check;;
+        secrets) cmd_secrets "$@";;
+        test-login) cmd_test_login;;
+        totp) cmd_totp "$@";;
+        ssh-setup) cmd_ssh_setup;;
         _connect) cmd__connect "$@";;
+        _ssh-proxy) cmd__ssh_proxy "$@";;
+        _ssh-master) cmd__ssh_master "$@";;
         -h|--help|help|"") usage;;
         *) usage; exit 2;;
     esac

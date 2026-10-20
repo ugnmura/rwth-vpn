@@ -1,13 +1,11 @@
 #!/bin/sh
-# Install rwth-vpn: openconnect + vpnc-script, bash, iproute2 (Linux), optional
-# vpn-slice, and the `rwth-vpn` command on PATH.
+# Install rwth-vpn for the current user. Never uses sudo: everything goes into
+# your home directory, and missing system packages are listed with the one
+# command to install them. Only `rwth-vpn up` (whole-machine tunnel) needs
+# root, when you run it.
 # POSIX sh on purpose: Void, Alpine and the BSDs don't ship bash by default.
 #
 #   ./install.sh [--no-split] [--user ab123456]
-#
-# Linux: Arch/Manjaro, Debian/Ubuntu, Fedora/RHEL (EPEL), openSUSE, Void,
-#        Alpine, Gentoo, Solus, NixOS (prints instructions).
-# macOS: Homebrew or MacPorts.  BSD: FreeBSD, OpenBSD, NetBSD (full mode only).
 
 set -eu
 
@@ -28,15 +26,11 @@ say() { printf '\n==> %s\n' "$*"; }
 warn() { echo "warning: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-ROOT=""
-if [ "$(id -u)" -ne 0 ]; then
-    if have sudo; then ROOT=sudo
-    elif have doas; then ROOT=doas
-    else echo "need sudo or doas (or run as root)" >&2; exit 1
-    fi
-fi
-
 OS=$(uname -s)
+PM=""
+for c in brew port pacman apt-get dnf yum zypper xbps-install apk emerge eopkg pkgin pkg_add pkg nix-env; do
+    if have "$c"; then PM=$c; break; fi
+done
 
 have_vpnc_script() {
     for p in /etc/vpnc/vpnc-script /usr/share/vpnc-scripts/vpnc-script \
@@ -50,84 +44,120 @@ have_vpnc_script() {
     [ -n "$p" ] && [ -x "$p" ]
 }
 
-# Install packages $1 (required) and, if vpnc-script is still missing, try the
-# candidate names in $2 one by one (they differ per distro and release).
-pkg_install() {
-    req=$1 extra=$2
-    case "$PM" in
-        pacman)
-            # Only sync when there's no database at all (fresh container/install);
-            # a bare -Sy on a live system would mean a partial upgrade.
-            sy=-S
-            ls /var/lib/pacman/sync/*.db >/dev/null 2>&1 || sy=-Sy
-            $ROOT pacman $sy --needed --noconfirm $req;;
-        apt) $ROOT apt-get update && $ROOT apt-get install -y $req;;
-        dnf) $ROOT dnf install -y $req;;
-        yum) $ROOT yum install -y $req;;
-        zypper) $ROOT zypper --non-interactive install $req;;
-        xbps) $ROOT xbps-install -Sy $req;;
-        apk) $ROOT apk add $req;;
-        emerge) $ROOT emerge --noreplace $req;;
-        eopkg) $ROOT eopkg install -y $req;;
-        brew) brew install $req;;
-        port) $ROOT port install $req;;
-        pkg) $ROOT pkg install -y $req;;
-        pkg_add) $ROOT pkg_add $req;;
-        pkgin) $ROOT pkgin -y install $req;;
-    esac
-    have_vpnc_script && return 0
-    for e in $extra; do
-        case "$PM" in
-            pacman) $ROOT pacman -S --needed --noconfirm "$e";;
-            apt) $ROOT apt-get install -y "$e";;
-            dnf|yum) $ROOT "$PM" install -y "$e";;
-            zypper) $ROOT zypper --non-interactive install "$e";;
-            xbps) $ROOT xbps-install -y "$e";;
-            apk) $ROOT apk add "$e";;
-            *) false;;
-        esac 2>/dev/null && have_vpnc_script && return 0
-    done
-    have_vpnc_script || warn "vpnc-script still missing; install your system's vpnc-scripts package"
+have_libevent() {
+    { have pkg-config && pkg-config --exists libevent; } ||
+        [ -e /usr/include/event2/event.h ] || [ -e /usr/local/include/event2/event.h ] ||
+        { have brew && [ -e "$(brew --prefix)/include/event2/event.h" ]; }
 }
 
-say "Installing openconnect"
-if [ "$OS" = Darwin ]; then
-    if have brew; then PM=brew
-    elif have port; then PM=port
-    else echo "install Homebrew (https://brew.sh) or MacPorts first" >&2; exit 1
-    fi
-    if have openconnect && have_vpnc_script; then
-        echo "already installed: $(openconnect --version | head -n 1)"
-    else
-        pkg_install openconnect ""
-    fi
-elif [ -e /etc/NIXOS ] || { have nix-env && ! have apt-get && ! have pacman && ! have dnf; }; then
-    if have openconnect; then
-        echo "already installed: $(openconnect --version | head -n 1)"
-    else
-        echo "NixOS: add 'openconnect' to environment.systemPackages (or: nix profile install nixpkgs#openconnect), then rerun." >&2
-        exit 1
-    fi
-else
-    PM=""
-    for c in pacman apt-get dnf yum zypper xbps-install apk emerge eopkg pkgin pkg_add pkg; do
-        if have "$c"; then PM=${c%-get}; PM=${PM%-install}; break; fi
-    done
-    [ -n "$PM" ] || { echo "unknown package manager: install openconnect, vpnc-script and bash yourself" >&2; exit 1; }
-    case "$OS" in
-        Linux)
-            case "$PM" in
-                emerge) pkgs="net-vpn/openconnect sys-apps/iproute2 app-shells/bash";;
-                *) pkgs="openconnect iproute2 bash";;
-            esac
-            [ "$PM" = dnf ] || [ "$PM" = yum ] && pkgs="openconnect iproute bash"
-            ;;
-        *) pkgs="openconnect bash";;
+# Package name(s) of a dependency for this package manager ("" = not packaged
+# separately).
+pkg() {
+    case "$1:$PM" in
+        python3:pacman|python3:brew) echo python;;
+        python3:emerge) echo dev-lang/python;;
+        openconnect:emerge) echo net-vpn/openconnect;;
+        openssh:brew) echo "";;    # macOS ships ssh
+        openssh:apt-get|openssh:apk) echo openssh-client;;
+        openssh:dnf|openssh:yum|openssh:zypper) echo openssh-clients;;
+        vpnc-script:apt-get) echo vpnc-scripts;;
+        vpnc-script:dnf|vpnc-script:yum) echo vpnc-script;;
+        vpnc-script:xbps-install|vpnc-script:apk|vpnc-script:zypper) echo vpnc;;
+        vpnc-script:*) echo "";;   # ships with openconnect
+        ip:dnf|ip:yum) echo iproute;;
+        ip:emerge) echo sys-apps/iproute2;;
+        ip:*) echo iproute2;;
+        ocproxy:apt-get|ocproxy:dnf|ocproxy:yum|ocproxy:brew|ocproxy:port|ocproxy:pkg) echo ocproxy;;
+        ocproxy:*) echo "";;
+        build:pacman) echo "base-devel autoconf automake libevent";;
+        build:apt-get) echo "build-essential autoconf automake libevent-dev";;
+        build:dnf|build:yum|build:zypper) echo "gcc make autoconf automake libevent-devel";;
+        build:xbps-install) echo "base-devel autoconf automake libevent-devel";;
+        build:apk) echo "build-base autoconf automake libevent-dev";;
+        build:*) echo "autoconf automake libevent";;
+        *) echo "$1";;
     esac
-    if have openconnect && have_vpnc_script && have bash && { [ "$OS" != Linux ] || have ip; }; then
-        echo "already installed: $(openconnect --version | head -n 1)"
+}
+
+install_hint() {
+    case "$PM" in
+        brew) echo "brew install $*";;
+        port) echo "sudo port install $*";;
+        pacman) echo "sudo pacman -S --needed $*";;
+        apt-get) echo "sudo apt install $*";;
+        dnf|yum) echo "sudo $PM install $*";;
+        zypper) echo "sudo zypper install $*";;
+        xbps-install) echo "sudo xbps-install -S $*";;
+        apk) echo "doas apk add $*";;
+        emerge) echo "sudo emerge --noreplace $*";;
+        eopkg) echo "sudo eopkg install $*";;
+        pkgin) echo "sudo pkgin install $*";;
+        pkg_add) echo "doas pkg_add $*";;
+        pkg) echo "sudo pkg install $*";;
+        nix-env) echo "add to environment.systemPackages: $*";;
+        *) echo "install with your package manager: $*";;
+    esac
+}
+
+say "Checking dependencies"
+NEED=""      # needed for everything (ssh included)
+NEED_UP=""   # only needed for `rwth-vpn up`
+add() { NEED="$NEED $(pkg "$1")"; }
+
+have openconnect || add openconnect
+have python3 || add python3
+have ssh || add openssh
+have bash || add bash
+have_vpnc_script || NEED_UP="$NEED_UP $(pkg vpnc-script)"
+[ "$OS" != Linux ] || have ip || NEED_UP="$NEED_UP $(pkg ip)"
+
+OCPROXY=""
+if have ocproxy; then OCPROXY=$(command -v ocproxy)
+elif [ -x "$HOME/.local/bin/ocproxy" ]; then OCPROXY=$HOME/.local/bin/ocproxy
+elif [ -n "$(pkg ocproxy)" ]; then add ocproxy
+elif ! { have cc && have make && have autoconf && have automake && have_libevent; }; then
+    NEED="$NEED $(pkg build)"
+fi
+have git || [ -n "$OCPROXY" ] || [ -n "$(pkg ocproxy)" ] || add git
+
+# Word-split on purpose to trim: these are space-separated package lists.
+# shellcheck disable=SC2086,SC2116
+NEED=$(echo $NEED) NEED_UP=$(echo $NEED_UP)
+
+# Homebrew installs per user, so run it; everything else needs root, which
+# this script doesn't use.
+if [ "$PM" = brew ] && [ -n "$NEED$NEED_UP" ]; then
+    # shellcheck disable=SC2086
+    brew install $NEED $NEED_UP
+    NEED="" NEED_UP=""
+    have ocproxy && OCPROXY=$(command -v ocproxy)
+fi
+
+if [ -n "$NEED" ]; then
+    echo "Missing system packages. Run this once, then rerun ./install.sh:"
+    # shellcheck disable=SC2086
+    echo "    $(install_hint $NEED $NEED_UP)"
+    exit 1
+fi
+if [ -n "$NEED_UP" ]; then
+    warn "'rwth-vpn up' (whole-machine tunnel) also needs: $NEED_UP"
+    # shellcheck disable=SC2086
+    echo "    $(install_hint $NEED_UP)"
+fi
+echo "ok: $(openconnect --version | head -n 1)"
+
+if [ -z "$OCPROXY" ]; then
+    say "Building ocproxy into ~/.local/bin (rootless VPN session for ssh)"
+    src=${XDG_CACHE_HOME:-$HOME/.cache}/rwth-vpn-build/ocproxy
+    rm -rf "$src" && mkdir -p "$(dirname "$src")"
+    if git clone -q --depth 1 https://github.com/cernekee/ocproxy.git "$src" &&
+        (cd "$src" && ./autogen.sh >/dev/null 2>&1 &&
+            ./configure --prefix="$HOME/.local" --disable-vpnns >/dev/null &&
+            make >/dev/null 2>&1) &&
+        mkdir -p "$HOME/.local/bin" && cp "$src/ocproxy" "$HOME/.local/bin/ocproxy"; then
+        echo "built $HOME/.local/bin/ocproxy"
     else
-        pkg_install "$pkgs" "vpnc-scripts vpnc-script vpnc"
+        warn "ocproxy build failed (cd $src && make); ssh via the VPN needs 'rwth-vpn up' meanwhile"
     fi
 fi
 
@@ -153,47 +183,42 @@ if [ "$WANT_SPLIT" = 1 ]; then
 fi
 
 say "Linking rwth-vpn into PATH"
-chmod +x "$REPO/rwth-vpn" "$REPO/lib/hook.sh"
-# Prefer a directory already on PATH that needs no root (e.g. Homebrew's bin
-# on Apple Silicon, where /usr/local/bin may not exist).
-BIN=""
-for d in /usr/local/bin "$(have brew && brew --prefix)/bin"; do
-    [ -d "$d" ] && [ -w "$d" ] && { BIN=$d; break; }
-done
-if [ -n "$BIN" ]; then
-    ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
-elif [ -d /usr/local/bin ]; then
-    BIN=/usr/local/bin
-    $ROOT ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
-else
-    BIN=$HOME/.local/bin
-    mkdir -p "$BIN"
-    ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
-    case ":$PATH:" in *":$BIN:"*) ;; *) warn "$BIN is not on your PATH";; esac
-fi
+chmod +x "$REPO/rwth-vpn" "$REPO/lib/hook.sh" "$REPO/lib/askpass.sh"
+# A user-writable directory: Homebrew's bin on macOS, else ~/.local/bin.
+BIN=$HOME/.local/bin
+if have brew && [ -w "$(brew --prefix)/bin" ]; then BIN=$(brew --prefix)/bin; fi
+mkdir -p "$BIN"
+ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
 echo "$BIN/rwth-vpn -> $REPO/rwth-vpn"
+case ":$PATH:" in
+    *":$BIN:"*) ;;
+    *) warn "$BIN is not on your PATH; add it in your shell profile (ssh works regardless)";;
+esac
 
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/config"
-if [ ! -e "$CFG" ]; then
-    if [ -z "$RWTH_USER" ] && [ -t 0 ]; then
-        printf '\nRWTH username (e.g. ab123456; empty = ask on every login): '
-        read -r RWTH_USER || true
-    fi
-    if [ -n "$RWTH_USER" ]; then
-        mkdir -p "$(dirname "$CFG")"
-        printf 'RWTH_USER=%s\n# RWTH_MODE=split\n' "$RWTH_USER" >"$CFG"
-        echo "wrote $CFG"
-    fi
+if [ -n "$RWTH_USER" ] && [ ! -e "$CFG" ]; then
+    mkdir -p "$(dirname "$CFG")"
+    printf 'RWTH_USER=%s\n# RWTH_MODE=split\n' "$RWTH_USER" >"$CFG"
+    echo "wrote $CFG"
 fi
+
+say "Setting up ssh for the RWTH HPC"
+"$REPO/rwth-vpn" ssh-setup
 
 say "Checking the server"
 "$REPO/rwth-vpn" check || true
 
+if [ -t 0 ] && [ -t 1 ]; then
+    printf '\nStore your logins and TOTP secrets now, so nothing ever prompts? [Y/n] '
+    read -r ans || ans=n
+    case "$ans" in [Nn]*) ;; *) "$REPO/rwth-vpn" secrets;; esac
+fi
+
 cat <<EOF
 
 Done.
-  rwth-vpn up           connect (all traffic via RWTH; Tailscale stays direct)
+  ssh claix             HPC login: no sudo, no prompts (VPN starts on demand)
+  rwth-vpn up           whole machine via RWTH (papers; asks for sudo)
   rwth-vpn up --split   only RWTH networks via the VPN
-  rwth-vpn status
-  rwth-vpn down
+  rwth-vpn status | down | secrets | totp
 EOF
