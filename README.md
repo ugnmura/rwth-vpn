@@ -137,10 +137,27 @@ Failed to complete authentication
 ```
 
 `rwth-vpn` sends `--useragent="AnyConnect Linux_64 5.1.6.103"`.
+
+Second, after a successful login the ASA answers the tunnel request with
+`HTTP/1.1 401 Unauthorized` / "Cookie was rejected by server" on openconnect
+**older than 9.20**. Those versions compute Cisco's STRAP channel binding
+wrongly over TLS 1.3 (fixed upstream in
+[94e0b16c](https://gitlab.com/openconnect/openconnect/-/commit/94e0b16c)).
+`rwth-vpn` caps such versions at TLS 1.2 using per-process GnuTLS or OpenSSL
+config files from `lib/`, so nothing system-wide changes. Many distros
+still ship 9.12.
 `rwth-vpn check` verifies the workaround without logging in. Run it first if
 logins suddenly break.
 
 ## Known limitations
+
+- RWTH assigns VPN addresses from 172.21.0.0/16. If a Docker network uses
+  that range, `rwth-vpn up` can clash with it; the rootless ssh session
+  can't. Move the Docker network (e.g. `default-address-pools` in
+  `/etc/docker/daemon.json`) if you need `up` on that machine.
+- The HPC login prompts (`Two-factor code:`, then `Password:`) are matched by
+  text. If RWTH rewords them, the helper refuses to answer rather than guess,
+  and `ssh.log` shows the new prompt.
 
 - On macOS and the BSDs, `up` uses plain vpnc-script. IPv6 isn't blocked
   there, so a dual-stack publisher may still see your home IPv6 address.

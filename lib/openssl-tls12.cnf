@@ -1,0 +1,9 @@
+# OpenSSL config for openconnect < 9.20 built against OpenSSL (see rwth-vpn
+# tls_workaround): cap TLS at 1.2.
+openssl_conf = default_conf
+[default_conf]
+ssl_conf = ssl_sect
+[ssl_sect]
+system_default = system_default_sect
+[system_default_sect]
+MaxProtocol = TLSv1.2

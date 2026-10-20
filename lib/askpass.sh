@@ -12,7 +12,8 @@ LIB_DIR=$(cd "$(dirname "$0")" && pwd)
 prompt=$(printf '%s' "$1" | sed 's/^([^)]*) *//' | tr '[:upper:]' '[:lower:]')
 
 case "$prompt" in
-    *otp*|*token*|*one-time*|*one\ time*|*second\ factor*|*2fa*|*verification\ code*|*authenticator*)
+    # CLAIX asks "Two-factor code:" (before the password).
+    *two-factor*|*two\ factor*|*otp*|*token*|*one-time*|*one\ time*|*second\ factor*|*2fa*|*verification\ code*|*authenticator*)
         # The HPC has its own TOTP tokens (RegApp), separate from the VPN's.
         secret_get hpc_totp_secret | python3 -I "$LIB_DIR/totp.py" --fresh
         ;;

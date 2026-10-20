@@ -92,6 +92,8 @@ find_ocproxy() {
 # piped in the order the ASA asks for them. Otherwise the user is prompted.
 authenticate() {
     local group=$1 gw=$2 user=${3:-$RWTH_USER}
+    # Read fresh: `rwth-vpn secrets` may have stored it after load_config ran.
+    [ -n "$user" ] || user=$(secret_get user || true)
     local args=("${UA_ARGS[@]}" --resolve="$SERVER:$gw" --authgroup="$group")
     [ -n "$user" ] && args+=(--user="$user")
     if [ -n "$user" ] && have_secret vpn_password && have_secret totp_secret; then
@@ -99,6 +101,10 @@ authenticate() {
         code=$(secret_get totp_secret | python3 -I "$LIB_DIR/totp.py" --fresh) || die "cannot compute TOTP code"
         { secret_get vpn_password; echo; echo "$code"; } |
             openconnect --authenticate "${args[@]}" "$SERVER" 2>>"${AUTH_LOG:-/dev/null}"
+    elif [ ! -t 0 ]; then
+        # No terminal to prompt on (agents, ssh ProxyCommand): fail clearly.
+        echo "rwth-vpn: VPN secrets incomplete (need username, VPN password, TOTP secret): run 'rwth-vpn secrets'" >&2
+        return 1
     else
         echo "Logging in to $SERVER ($group). Enter your VPN password, then the TOTP code." >&2
         echo "(Store them once with 'rwth-vpn secrets' to skip this.)" >&2
@@ -111,6 +117,24 @@ auth_field() {
 }
 
 UA_ARGS=(--useragent="AnyConnect Linux_64 $AC_VERSION" --version-string="$AC_VERSION" --os=linux-64)
+
+# openconnect < 9.20 computes Cisco STRAP channel bindings wrongly over TLS 1.3
+# (fixed upstream in 94e0b16c, "Use RFC9266 tls-exporter ... with TLSv1.3"), so
+# RWTH's ASA accepts the login but answers the tunnel CONNECT with 401 "Cookie
+# was rejected". Cap those versions at TLS 1.2 for openconnect only, through
+# per-process config files; nothing system-wide changes.
+tls_workaround() {
+    command -v openconnect >/dev/null 2>&1 || return 0
+    local v major minor
+    v=$(openconnect --version 2>&1 | sed -n 's/^OpenConnect version v\{0,1\}\([0-9]*\)\.\([0-9]*\).*/\1 \2/p' | head -n 1)
+    read -r major minor <<<"${v:-0 0}"
+    [ "$((major * 100 + minor))" -lt 920 ] || return 0
+    if openconnect --version 2>&1 | grep -q 'Using OpenSSL'; then
+        export OPENSSL_CONF="$LIB_DIR/openssl-tls12.cnf"
+    else
+        export GNUTLS_SYSTEM_PRIORITY_FILE="$LIB_DIR/gnutls-tls12.conf"
+    fi
+}
 
 is_running() {
     [ -r "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
@@ -560,7 +584,8 @@ cmd_secrets() {
         echo "VPN secrets incomplete: logins will prompt for what's missing."
     fi
     rm -f "$VPN_FAIL_MARK" "$HPC_FAIL_MARK"
-    [ -r "$SSH_CONF" ] || cmd_ssh_setup >/dev/null
+    # Regenerate: the HPC username goes into the ssh config's User line.
+    cmd_ssh_setup >/dev/null
     have_secret hpc_password && echo "Next: ssh claix hostname"
 }
 
@@ -629,6 +654,7 @@ main() {
     local cmd=${1:-}
     [ $# -gt 0 ] && shift
     load_config
+    tls_workaround
     case "$cmd" in
         up) cmd_up "$@";;
         down) cmd_down;;
