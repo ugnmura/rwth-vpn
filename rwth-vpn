@@ -137,7 +137,8 @@ tls_workaround() {
 }
 
 is_running() {
-    [ -r "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+    # ps, not kill -0: the tunnel runs as root, so kill -0 from the user fails (EPERM).
+    [ -r "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1
 }
 
 find_vpnc_script() {
