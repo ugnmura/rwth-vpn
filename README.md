@@ -1,170 +1,83 @@
 # rwth-vpn
 
-RWTH Aachen VPN and HPC access from any Linux, macOS or BSD machine, built on
-[openconnect](https://www.infradead.org/openconnect/). It runs alongside
-Tailscale, needs no Cisco client, and asks for no TOTP code once set up.
+> [!WARNING]
+> This is a personal tool, tested against RWTH's real VPN and CLAIX. RWTH can change things on their end at any time. Keep your expectations reasonable.
 
-```sh
-ssh claix 'squeue --me'   # HPC: no sudo, no password, no TOTP; VPN starts on demand
-rwth-vpn up               # whole machine via RWTH (paper access); asks for sudo
-rwth-vpn status
-rwth-vpn down
+Connect to the RWTH Aachen VPN and the CLAIX HPC cluster from Linux, macOS or BSD without the Cisco client. You store your secrets once, and after that there are no passwords or TOTP codes to type. It plays nicely with Tailscale.
+
+## Quick Start
+
+```console
+$ git clone git@github.com:ugnmura/rwth-vpn.git ~/src/rwth-vpn
+$ ~/src/rwth-vpn/install.sh
+$ ssh claix
 ```
 
-## Setup (once per machine, no sudo)
+That's it. The installer never uses sudo. If a system package is missing, it tells you the command to install it and stops, so you can run that command and rerun the installer.
 
-```sh
-git clone git@github.com:ugnmura/rwth-vpn.git ~/src/rwth-vpn
-~/src/rwth-vpn/install.sh
+## Usage
+
+```console
+$ ssh claix                # HPC login, no sudo, no prompts
+$ rwth-vpn up              # route the whole machine through RWTH (asks for sudo)
+$ rwth-vpn up --split      # only RWTH networks through the VPN
+$ rwth-vpn status
+$ rwth-vpn down
 ```
 
-The installer puts everything in your home directory:
-- links `rwth-vpn` into `~/.local/bin` (Homebrew's `bin` on macOS);
-- builds `ocproxy` if your distro doesn't package it;
-- sets up `~/.ssh` for the HPC;
-- asks for your secrets.
+### `ssh claix`
 
-It never runs sudo. If system packages are missing, it prints the one command
-to install them (e.g. `sudo apt install openconnect ocproxy python3`) and
-stops, so you can run that and rerun it. On macOS it uses Homebrew directly.
+You don't need to run `rwth-vpn up` first. If the VPN isn't up, ssh starts a small VPN session just for itself, logs in with your stored password and TOTP, and keeps the connection open for 8 hours. Later `ssh`, `scp` and `rsync` calls reuse it instantly.
 
-### Where to get the secrets
+`claix`, `login23-*` and `copy23-*` all work, and so does VS Code Remote-SSH. Agents can use it too: `ssh -o BatchMode=yes claix 'sbatch job.sh'` works fine.
 
-`rwth-vpn secrets` asks for these and shows where to get each one, with links. `rwth-vpn secrets --where` prints just that guide, and `rwth-vpn test-login` checks the stored VPN login. Enter only what
-you use: VPN-only use doesn't need the HPC entries.
+### `rwth-vpn up`
 
-| Secret | Where | Notes |
-|---|---|---|
-| RWTH username | your TIM ID, e.g. `ab123456` | |
-| VPN password | [IdM Selfservice](https://idm.rwth-aachen.de/selfservice/): set or change the VPN password there | separate from your RWTH SSO password |
-| VPN TOTP secret | [IdM Selfservice](https://idm.rwth-aachen.de/selfservice/) → Token Manager → new token → *Authenticator app (TOTP)* | see below |
-| HPC username | [RegApp](https://regapp.itc.rwth-aachen.de/) | usually the same `ab123456` |
-| HPC password | [RegApp](https://regapp.itc.rwth-aachen.de/): your HPC account's password | separate from the VPN password |
-| HPC TOTP secret | [RegApp](https://regapp.itc.rwth-aachen.de/): set up the HPC second factor (TOTP) | the HPC has its own tokens |
+Use this when you need more than ssh, for example to download papers from IEEE, Springer or Elsevier. Those sites check that your traffic comes from RWTH.
 
-**Getting a TOTP secret.** When you create the token, the page shows a QR code
-and the secret as text. Copy the text (base32, e.g. `JBSWY3DP…`) or the
-`otpauth://…` link into `rwth-vpn secrets`. Also scan the same QR code with
-your phone's authenticator app, so you can still log in by hand. Then enter
-one code to finish creating the token. Keep the default SHA1 / 6 digits;
-otherwise paste the `otpauth://` link, which carries those settings.
-`rwth-vpn totp` (or `rwth-vpn totp hpc`) prints the current code: it should match your phone.
+- **Full tunnel** (the default): all your traffic goes through RWTH. Tailscale keeps working directly, so you don't lose your ssh session to the machine.
+- **Split tunnel** (`--split`): only RWTH addresses go through the VPN. That's enough for CLAIX, but publishers won't see you as RWTH.
 
-RWTH's guides: [VPN with authenticator app](https://help.itc.rwth-aachen.de/en/service/vbf6fx0gom76/article/34c748946f63455090ede2dd5a7a49e5),
-[HPC login](https://help.itc.rwth-aachen.de/service/rhr4fjjutttf/article/fb61d6c86ae245b5b7bba8c0cb7db6eb/).
+To make split the default, put `RWTH_MODE=split` in `~/.config/rwth-vpn/config`.
 
-**Where they're stored.** On macOS they go in the login Keychain (service
-`rwth-vpn`). Elsewhere they go in `~/.config/rwth-vpn/secrets` (mode 0600),
-because keyring daemons need an unlocked desktop session, which agents and
-headless machines don't have.
+## Secrets
 
-The trade-off: with the TOTP seed stored next to the password, this machine
-holds both factors. Anyone with your user account on it gets your RWTH VPN
-and HPC access. Only store secrets on machines you'd trust with that.
+`rwth-vpn secrets` asks for everything and shows where to get each secret. You only need the HPC secrets if you use the HPC.
 
-## HPC over ssh
-
-`ssh-setup`, which the installer runs, adds `Include ~/.ssh/rwth-vpn.conf` to
-your ssh config. That file defines:
-
-| Name | Host |
+| Secret | Where to get it |
 |---|---|
-| `claix` | login23-1.hpc.itc.rwth-aachen.de |
-| `login23-*`, `copy23-*` | `<name>.hpc.itc.rwth-aachen.de` |
+| RWTH username | Your TIM ID, e.g. `ab123456` |
+| VPN password | [IdM Selfservice](https://idm.rwth-aachen.de/selfservice/). Not your SSO password. |
+| VPN TOTP secret | [IdM Selfservice](https://idm.rwth-aachen.de/selfservice/) → Token Manager → new *Authenticator app (TOTP)* token |
+| HPC password | [RegApp](https://regapp.itc.rwth-aachen.de/) |
+| HPC TOTP secret | [RegApp](https://regapp.itc.rwth-aachen.de/), the HPC's own second factor |
 
-So `ssh claix`, `ssh login23-2`, `scp file copy23-1:` and `rsync -e ssh` all
-work, as does VS Code Remote-SSH. On first use:
-1. If the whole-machine tunnel isn't up, a **rootless VPN session** starts:
-   openconnect + ocproxy, a SOCKS proxy only ssh uses. The rest of the machine
-   is untouched and no sudo is needed.
-2. One **master connection** logs in, answering the password and TOTP prompts
-   from your secrets, and stays open for 8 hours.
-3. Every later `ssh`/`scp`/`rsync` to the HPC reuses it instantly.
+When you create a TOTP token, copy the secret text (`JBSWY3DP…`) or the `otpauth://` link. Scan the same QR code with your phone too, so you can still log in by hand. `rwth-vpn totp` (or `rwth-vpn totp hpc`) prints the current code, which should match your phone.
 
-### For agents
+On macOS the secrets are stored in the Keychain. Everywhere else they go in `~/.config/rwth-vpn/secrets` (mode 0600).
 
-Agents can use the HPC exactly like a human. There are no special flags, and
-`-o BatchMode=yes` is fine:
+**Be aware:** this machine now holds both factors. Anyone with your user account on it gets your RWTH VPN and HPC access.
 
-```sh
-ssh claix 'sbatch job.sh'
-rsync -az results/ claix:work/results/
-```
+## Supported Platforms
 
-Parallel calls share one VPN session and one login. If something's off,
-`rwth-vpn status` shows the sessions, and the logs are
-`~/.cache/rwth-vpn/{proxy,ssh}.log` (or under `$XDG_RUNTIME_DIR`).
+- Debian, Ubuntu, Fedora: everything is packaged
+- Arch, Manjaro, openSUSE, Void, Alpine, Gentoo, Solus: `ocproxy` is built from source
+- NixOS: add `openconnect` and `ocproxy` to your config
+- macOS: via Homebrew
+- FreeBSD, OpenBSD, NetBSD: full tunnel only
 
-## Whole-machine tunnel (`rwth-vpn up`)
+## Why Not Just Use openconnect?
 
-This is for paper access (IEEE, Springer, Elsevier, … check that your traffic
-comes from RWTH) and anything else that isn't ssh. It's the only part that
-needs root, and it asks for sudo, or doas.
+Plain openconnect doesn't work with RWTH, for two reasons:
 
-- **Default (full tunnel):** all traffic leaves through RWTH. On Linux:
-  - **Tailscale keeps working directly:** its own traffic keeps using your
-    normal uplink.
-  - **IPv6 is blocked while connected** if the VPN gives none, so dual-stack
-    sites can't see your home address.
-  - Docker follows the host.
-- **`--split`:** only RWTH networks go through the VPN (the server's
-  split-include list plus 134.61/16, 134.130/16, 137.226/16). Set
-  `RWTH_MODE=split` in `~/.config/rwth-vpn/config` to make it the default.
+1. RWTH's Cisco ASA answers **404** to any client that doesn't call itself `AnyConnect`. `rwth-vpn` sends the right User-Agent.
+2. openconnect **older than 9.20** gets "Cookie was rejected" after logging in, because of a TLS 1.3 bug ([fixed upstream](https://gitlab.com/openconnect/openconnect/-/commit/94e0b16c)). Many distros still ship 9.12. `rwth-vpn` limits those versions to TLS 1.2 without changing anything system-wide.
 
-While `up` is active, ssh to the HPC goes through it directly. `up` replaces
-the rootless ssh session, since RWTH allows only one VPN session.
+If logins suddenly break, run `rwth-vpn check` first.
 
-## Platforms
+## Known Issues
 
-| Platform | Notes |
-|---|---|
-| Arch / Manjaro | ocproxy built from source |
-| Debian / Ubuntu, Fedora | everything packaged |
-| openSUSE, Void, Alpine, Gentoo, Solus | ocproxy built from source |
-| NixOS | add `openconnect` (+ `ocproxy`) to your config |
-| macOS | Homebrew; secrets in the Keychain |
-| FreeBSD / OpenBSD / NetBSD | full tunnel only (vpn-slice is Linux/macOS) |
-
-## Why stock openconnect fails
-
-RWTH's VPN is a Cisco ASA that answers **HTTP 404** to any client whose
-User-Agent isn't `AnyConnect <OS> <version>`. Stock openconnect sends
-`Open AnyConnect VPN Agent`, so you get:
-
-```
-Unexpected 404 result from server
-Failed to complete authentication
-```
-
-`rwth-vpn` sends `--useragent="AnyConnect Linux_64 5.1.6.103"`.
-
-Second, after a successful login the ASA answers the tunnel request with
-`HTTP/1.1 401 Unauthorized` / "Cookie was rejected by server" on openconnect
-**older than 9.20**. Those versions compute Cisco's STRAP channel binding
-wrongly over TLS 1.3 (fixed upstream in
-[94e0b16c](https://gitlab.com/openconnect/openconnect/-/commit/94e0b16c)).
-`rwth-vpn` caps such versions at TLS 1.2 using per-process GnuTLS or OpenSSL
-config files from `lib/`, so nothing system-wide changes. Many distros
-still ship 9.12.
-`rwth-vpn check` verifies the workaround without logging in. Run it first if
-logins suddenly break.
-
-## Known limitations
-
-- RWTH assigns VPN addresses from 172.21.0.0/16. If a Docker network uses
-  that range, `rwth-vpn up` can clash with it; the rootless ssh session
-  can't. Move the Docker network (e.g. `default-address-pools` in
-  `/etc/docker/daemon.json`) if you need `up` on that machine.
-- The HPC login prompts (`Two-factor code:`, then `Password:`) are matched by
-  text. If RWTH rewords them, the helper refuses to answer rather than guess,
-  and `ssh.log` shows the new prompt.
-
-- On macOS and the BSDs, `up` uses plain vpnc-script. IPv6 isn't blocked
-  there, so a dual-stack publisher may still see your home IPv6 address.
-- In full mode, vpnc-script points `/etc/resolv.conf` at RWTH's DNS. If
-  DHCP rewrites it on lease renewal, RWTH-internal names stop resolving until
-  you reconnect.
-- The askpass helper recognises prompts mentioning password,
-  OTP/token/one-time/second factor/verification code. It refuses anything
-  else rather than guess. If RWTH words a prompt differently,
-  `~/.cache/rwth-vpn/ssh.log` shows it.
+- RWTH's VPN uses `172.21.0.0/16`. If one of your Docker networks uses that range, `rwth-vpn up` clashes with it. `ssh claix` is not affected.
+- The HPC login prompts are matched by their text. If RWTH rewords them, the login stops instead of guessing, and `~/.cache/rwth-vpn/ssh.log` shows the new prompt.
+- On macOS and the BSDs, the full tunnel doesn't block IPv6, so publishers might still see your home IPv6 address.
+- In full mode, if DHCP rewrites `/etc/resolv.conf`, RWTH-internal names stop resolving until you reconnect.
