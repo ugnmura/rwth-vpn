@@ -1,0 +1,98 @@
+POST https://vpn.rwth-aachen.de/
+Attempting to connect to server [2a00:8a60:0:6000:2100:1:2:1]:443
+Connected to [2a00:8a60:0:6000:2100:1:2:1]:443
+SSL negotiation with vpn.rwth-aachen.de
+Connected to HTTPS on vpn.rwth-aachen.de with ciphersuite (TLS1.3)-(ECDHE-SECP256R1)-(RSA-PSS-RSAE-SHA256)-(AES-128-GCM)
+> POST / HTTP/1.1
+> Host: vpn.rwth-aachen.de
+> User-Agent: Open AnyConnect VPN Agent v9.12
+> Accept: */*
+> Accept-Encoding: identity
+> X-Transcend-Version: 1
+> X-Aggregate-Auth: 1
+> X-Support-HTTP-Auth: true
+> X-AnyConnect-STRAP-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9Cmk3/uN/0fwm0fW2fRpl9aj4iunwrO1ahw5ArDKsKTRlOwVP7a8WZ1xAR87eUpc6WQS75ng5J8CUlWAFlrRXQ==
+> X-AnyConnect-STRAP-DH-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAErQ6+jJNXPqYWQw1z6d4Ah1K7UouXDmTG5zbueBxpetJGgPPbLeCWoXHJvYmfW7gSrlskHnwRY/rLXkp4E5089Q==
+> X-Pad: 0000000000000
+> Content-Type: application/xml; charset=utf-8
+> Content-Length: 371
+> 
+> <?xml version="1.0" encoding="UTF-8"?>
+> <config-auth client="vpn" type="init" aggregate-auth-version="2"><version who="vpn">v9.12</version><device-id>linux-64</device-id><capabilities><auth-method>single-sign-on-v2</auth-method><auth-method>single-sign-on-external-browser</auth-method></capabilities><group-access>https://vpn.rwth-aachen.de/</group-access></config-auth>
+Got HTTP response: HTTP/1.1 404 Not Found
+Cache-Control: no-store
+Pragma: no-cache
+Connection: Close
+Date: Mon, 19 Oct 2026 22:06:06 GMT
+X-Frame-Options: SAMEORIGIN
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1
+Content-Security-Policy: default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; frame-ancestors 'self'; base-uri 'self'; block-all-mixed-content
+Cross-Origin-Opener-Policy: same-origin-allow-popups
+HTTP body http 1.0 (-1)
+TLS/DTLS socket closed uncleanly
+Unexpected 404 result from server
+GET https://vpn.rwth-aachen.de/
+Attempting to connect to server [2a00:8a60:0:6000:2100:1:2:1]:443
+Connected to [2a00:8a60:0:6000:2100:1:2:1]:443
+SSL negotiation with vpn.rwth-aachen.de
+Connected to HTTPS on vpn.rwth-aachen.de with ciphersuite (TLS1.3)-(ECDHE-SECP256R1)-(RSA-PSS-RSAE-SHA256)-(AES-128-GCM)
+> GET / HTTP/1.1
+> Host: vpn.rwth-aachen.de
+> User-Agent: Open AnyConnect VPN Agent v9.12
+> Accept: */*
+> Accept-Encoding: identity
+> X-Transcend-Version: 1
+> X-Support-HTTP-Auth: true
+> X-AnyConnect-STRAP-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9Cmk3/uN/0fwm0fW2fRpl9aj4iunwrO1ahw5ArDKsKTRlOwVP7a8WZ1xAR87eUpc6WQS75ng5J8CUlWAFlrRXQ==
+> X-AnyConnect-STRAP-DH-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAErQ6+jJNXPqYWQw1z6d4Ah1K7UouXDmTG5zbueBxpetJGgPPbLeCWoXHJvYmfW7gSrlskHnwRY/rLXkp4E5089Q==
+> X-Pad: 0000000000000000000000000000000000000000000000000000000000000000
+> Content-Type: application/x-www-form-urlencoded
+> Content-Length: 0
+> 
+Got HTTP response: HTTP/1.0 302 Object Moved
+Content-Type: text/html; charset=utf-8
+Content-Length: 0
+Cache-Control: no-store
+Pragma: no-cache
+Connection: Close
+Date: Mon, 19 Oct 2026 22:06:08 GMT
+X-Frame-Options: SAMEORIGIN
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1
+Content-Security-Policy: default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; frame-ancestors 'self'; base-uri 'self'; block-all-mixed-content
+Cross-Origin-Opener-Policy: same-origin-allow-popups
+Location: /+webvpn+/index.html
+Set-Cookie: tg=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; secure
+HTTP body length:  (0)
+GET https://vpn.rwth-aachen.de/+webvpn+/index.html
+SSL negotiation with vpn.rwth-aachen.de
+Connected to HTTPS on vpn.rwth-aachen.de with ciphersuite (TLS1.3)-(ECDHE-SECP256R1)-(RSA-PSS-RSAE-SHA256)-(AES-128-GCM)
+> GET /+webvpn+/index.html HTTP/1.1
+> Host: vpn.rwth-aachen.de
+> User-Agent: Open AnyConnect VPN Agent v9.12
+> Accept: */*
+> Accept-Encoding: identity
+> X-Transcend-Version: 1
+> X-Support-HTTP-Auth: true
+> X-AnyConnect-STRAP-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9Cmk3/uN/0fwm0fW2fRpl9aj4iunwrO1ahw5ArDKsKTRlOwVP7a8WZ1xAR87eUpc6WQS75ng5J8CUlWAFlrRXQ==
+> X-AnyConnect-STRAP-DH-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAErQ6+jJNXPqYWQw1z6d4Ah1K7UouXDmTG5zbueBxpetJGgPPbLeCWoXHJvYmfW7gSrlskHnwRY/rLXkp4E5089Q==
+> X-Pad: 0000000000000000000000000000000000000000000000000000000000000000
+> Content-Type: application/x-www-form-urlencoded
+> Content-Length: 0
+> 
+Got HTTP response: HTTP/1.1 404 Not Found
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1
+Content-Security-Policy: default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; frame-ancestors 'self'; base-uri 'self'; block-all-mixed-content
+X-Frame-Options: SAMEORIGIN
+Cross-Origin-Opener-Policy: same-origin-allow-popups
+Connection: close
+X-Transcend-Version: 1
+HTTP body http 1.0 (-1)
+TLS/DTLS socket closed uncleanly
+Unexpected 404 result from server
+Failed to complete authentication

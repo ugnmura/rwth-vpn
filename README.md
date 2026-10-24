@@ -8,12 +8,12 @@ Connect to the RWTH Aachen VPN and the CLAIX HPC cluster from Linux, macOS or BS
 ## Quick Start
 
 ```console
-$ git clone git@github.com:ugnmura/rwth-vpn.git ~/src/rwth-vpn
-$ ~/src/rwth-vpn/install.sh
+$ git clone git@github.com:ugnmura/rwth-vpn.git /tmp/rwth-vpn
+$ /tmp/rwth-vpn/install.sh && rm -rf /tmp/rwth-vpn
 $ ssh claix
 ```
 
-That's it. The installer never uses sudo. If a system package is missing, it tells you the command to install it and stops, so you can run that command and rerun the installer.
+That's it. `rwth-vpn` is a single self-contained script; the installer copies it to `~/.local/bin` (Homebrew's bin on macOS), so the clone isn't needed afterwards. To update, do the same again. The installer never uses sudo. If a system package is missing, it tells you the command to install it and stops, so you can run that command and rerun the installer.
 
 ## Usage
 

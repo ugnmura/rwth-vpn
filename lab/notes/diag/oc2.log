@@ -1,0 +1,61 @@
+POST https://vpn.rwth-aachen.de/
+Attempting to connect to server [2a00:8a60:0:6000:2100:1:2:1]:443
+Connected to [2a00:8a60:0:6000:2100:1:2:1]:443
+SSL negotiation with vpn.rwth-aachen.de
+Connected to HTTPS on vpn.rwth-aachen.de with ciphersuite (TLS1.3)-(ECDHE-SECP256R1)-(RSA-PSS-RSAE-SHA256)-(AES-128-GCM)
+> POST / HTTP/1.1
+> Host: vpn.rwth-aachen.de
+> User-Agent: AnyConnect Linux_64 5.1.6.103
+> Accept: */*
+> Accept-Encoding: identity
+> X-Transcend-Version: 1
+> X-Aggregate-Auth: 1
+> X-Support-HTTP-Auth: true
+> X-AnyConnect-STRAP-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOQ8XNZ5ntgbdshy9dRVk1FfD8lvCM4Q2CbQo+AXahvV4anj8yB/kwEndUMbOyBCoZdhs/aOzDyLiRK4A5Q09Lg==
+> X-AnyConnect-STRAP-DH-Pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEspYfT5680mZwBVm9DIBOWuIwvzwpVjlIvaGGRXVHPVxzuXnNm0RHBPZZGG2BdBs2Aq+XLVxalV+dP7fLfrTToQ==
+> X-Pad: 000000000
+> Content-Type: application/xml; charset=utf-8
+> Content-Length: 375
+> 
+> <?xml version="1.0" encoding="UTF-8"?>
+> <config-auth client="vpn" type="init" aggregate-auth-version="2"><version who="vpn">5.1.6.103</version><device-id>linux-64</device-id><capabilities><auth-method>single-sign-on-v2</auth-method><auth-method>single-sign-on-external-browser</auth-method></capabilities><group-access>https://vpn.rwth-aachen.de/</group-access></config-auth>
+Got HTTP response: HTTP/1.1 200 OK
+Content-Type: text/xml; charset=utf-8
+Transfer-Encoding: chunked
+Cache-Control: no-store
+Pragma: no-cache
+Connection: Keep-Alive
+Date: Mon, 19 Oct 2026 22:06:59 GMT
+X-Frame-Options: SAMEORIGIN
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1
+Content-Security-Policy: default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; frame-ancestors 'self'; base-uri 'self'; block-all-mixed-content
+Cross-Origin-Opener-Policy: same-origin-allow-popups
+X-Aggregate-Auth: 1
+HTTP body chunked (-2)
+< <?xml version="1.0" encoding="UTF-8"?>
+< <config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
+< <opaque is-for="sg">
+< <tunnel-group>TunnelGroup_RWTH_Full</tunnel-group>
+< <aggauth-handle>13575993810883545246</aggauth-handle>
+< <auth-method>single-sign-on-v2</auth-method>
+< <auth-method>single-sign-on-external-browser</auth-method>
+< <group-alias>RWTH-VPN (Full Tunnel)</group-alias>
+< <config-hash>1789496555606</config-hash>
+< </opaque>
+< <auth id="main">
+< <form>
+< <input type="text" name="username" label="Username:"></input>
+< <input type="password" name="password" label="Password:"></input>
+< <select name="group_list" label="GROUP:">
+< <option selected="true">RWTH-VPN (Full Tunnel)</option>
+< <option>RWTH-VPN (Split Tunnel)</option>
+< </select>
+< </form>
+< </auth>
+< </config-auth>
+XML POST enabled
+GROUP: [RWTH-VPN (Full Tunnel)|RWTH-VPN (Split Tunnel)]:***
+User input required in non-interactive mode
+Failed to complete authentication

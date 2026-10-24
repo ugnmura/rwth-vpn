@@ -182,14 +182,15 @@ if [ "$WANT_SPLIT" = 1 ]; then
     esac
 fi
 
-say "Linking rwth-vpn into PATH"
-chmod +x "$REPO/rwth-vpn" "$REPO/lib/hook.sh" "$REPO/lib/askpass.sh"
+say "Installing rwth-vpn into PATH"
 # A user-writable directory: Homebrew's bin on macOS, else ~/.local/bin.
 BIN=$HOME/.local/bin
 if have brew && [ -w "$(brew --prefix)/bin" ]; then BIN=$(brew --prefix)/bin; fi
 mkdir -p "$BIN"
-ln -sf "$REPO/rwth-vpn" "$BIN/rwth-vpn"
-echo "$BIN/rwth-vpn -> $REPO/rwth-vpn"
+# A copy, not a link: the script is self-contained, so the clone can go.
+rm -f "$BIN/rwth-vpn"
+cp "$REPO/rwth-vpn" "$BIN/rwth-vpn" && chmod 755 "$BIN/rwth-vpn"
+echo "installed $BIN/rwth-vpn"
 case ":$PATH:" in
     *":$BIN:"*) ;;
     *) warn "$BIN is not on your PATH; add it in your shell profile (ssh works regardless)";;
@@ -203,15 +204,15 @@ if [ -n "$RWTH_USER" ] && [ ! -e "$CFG" ]; then
 fi
 
 say "Setting up ssh for the RWTH HPC"
-"$REPO/rwth-vpn" ssh-setup
+"$BIN/rwth-vpn" ssh-setup
 
 say "Checking the server"
-"$REPO/rwth-vpn" check || true
+"$BIN/rwth-vpn" check || true
 
 if [ -t 0 ] && [ -t 1 ]; then
     printf '\nStore your logins and TOTP secrets now, so nothing ever prompts? [Y/n] '
     read -r ans || ans=n
-    case "$ans" in [Nn]*) ;; *) "$REPO/rwth-vpn" secrets;; esac
+    case "$ans" in [Nn]*) ;; *) "$BIN/rwth-vpn" secrets;; esac
 fi
 
 cat <<EOF

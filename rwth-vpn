@@ -43,7 +43,181 @@ resolve_self() {
     echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
 }
 SELF=$(resolve_self "$0")
-LIB_DIR=$(dirname "$SELF")/lib
+
+
+# Python helpers (standard library only), run as python3 -I -c "$X_PY" ARGS.
+read -r -d '' TOTP_PY <<'PY' || true
+"""RFC 6238 TOTP code for the secret on stdin (base32 or an otpauth:// URI).
+
+Reads the secret from stdin so it never shows up in `ps`. Standard library only.
+
+    totp           print the current code
+    totp --fresh   a code valid for >= 5 s that no earlier --fresh call
+                      returned for this secret (waits for the next one if needed)
+
+Servers reject a code that was already accepted (replay), so two logins with
+one token in one 30 s window (e.g. down and up again) must not share a code.
+"""
+import base64
+import fcntl
+import hashlib
+import hmac
+import os
+import struct
+import sys
+import time
+import urllib.parse
+
+MIN_VALIDITY = 5
+
+
+def parse(raw):
+    """Return (key, digits, period, digest) from a base32 secret or otpauth URI."""
+    raw = raw.strip()
+    digits, period, digest = 6, 30, hashlib.sha1
+    if raw.lower().startswith("otpauth://"):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(raw).query)
+        secret = q["secret"][0]
+        digits = int(q.get("digits", ["6"])[0])
+        period = int(q.get("period", ["30"])[0])
+        digest = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256,
+                  "SHA512": hashlib.sha512}[q.get("algorithm", ["SHA1"])[0].upper()]
+    else:
+        secret = raw
+    secret = secret.replace(" ", "").replace("-", "").upper()
+    if not secret:
+        sys.exit("totp: empty secret")
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    return key, digits, period, digest
+
+
+def code(key, digits, period, digest, now):
+    mac = hmac.new(key, struct.pack(">Q", int(now) // period), digest).digest()
+    off = mac[-1] & 0x0F
+    n = struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF
+    return str(n % 10 ** digits).zfill(digits)
+
+
+def fresh_time(key, period):
+    """Return a time in a step that is valid long enough and not yet used."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache")
+    # Per token (VPN and HPC are separate), named by a hash, not the secret.
+    tag = hashlib.sha256(key).hexdigest()[:12]
+    path = os.path.join(base, "rwth-vpn", "totp-%s.last" % tag)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "a+") as f:
+        # Held while waiting, so parallel callers get successive steps.
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        last = f.read().strip()
+        last = int(last) if last.isdigit() else -1
+        while True:
+            now = time.time()
+            left = period - now % period
+            if left >= MIN_VALIDITY and int(now // period) > last:
+                break
+            time.sleep(left + 0.2)
+        f.seek(0)
+        f.truncate()
+        f.write(str(int(now // period)))
+    return now
+
+
+def main():
+    key, digits, period, digest = parse(sys.stdin.read())
+    now = time.time()
+    if "--fresh" in sys.argv[1:]:
+        now = fresh_time(key, period)
+    print(code(key, digits, period, digest, now))
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+read -r -d '' CONNECT_PY <<'PY' || true
+"""ssh ProxyCommand: relay stdin/stdout to HOST:PORT, directly or via SOCKS5.
+
+    connect HOST PORT                 direct TCP (system tunnel is up)
+    connect HOST PORT SOCKS_PORT      through the local ocproxy SOCKS5 proxy
+
+The hostname goes to the proxy unresolved, so the VPN's DNS resolves it.
+Standard library only.
+"""
+import os
+import selectors
+import socket
+import struct
+import sys
+
+
+def socks5(sock, host, port):
+    sock.sendall(b"\x05\x01\x00")
+    if sock.recv(2) != b"\x05\x00":
+        sys.exit("socks: proxy refused no-auth method")
+    h = host.encode()
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + struct.pack(">H", port))
+    head = recv_exact(sock, 4)
+    if head[1] != 0:
+        sys.exit(f"socks: connect to {host}:{port} failed (code {head[1]})")
+    # Skip the bound address in the reply.
+    atyp = head[3]
+    n = {1: 4, 4: 16}.get(atyp)
+    if n is None:
+        n = recv_exact(sock, 1)[0]
+    recv_exact(sock, n + 2)
+
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            sys.exit("socks: proxy closed the connection")
+        buf += chunk
+    return buf
+
+
+def relay(sock):
+    sel = selectors.DefaultSelector()
+    stdin, stdout = sys.stdin.fileno(), sys.stdout.fileno()
+    sel.register(stdin, selectors.EVENT_READ)
+    sel.register(sock, selectors.EVENT_READ)
+    open_ends = 2
+    while open_ends:
+        for key, _ in sel.select():
+            if key.fileobj == stdin:
+                data = os.read(stdin, 65536)
+                if data:
+                    sock.sendall(data)
+                else:
+                    sel.unregister(stdin)
+                    sock.shutdown(socket.SHUT_WR)
+                    open_ends -= 1
+            else:
+                data = sock.recv(65536)
+                if data:
+                    os.write(stdout, data)
+                else:
+                    sel.unregister(sock)
+                    open_ends -= 1
+                    return
+
+
+def main():
+    host, port = sys.argv[1], int(sys.argv[2])
+    if len(sys.argv) > 3:
+        sock = socket.create_connection(("127.0.0.1", int(sys.argv[3])), timeout=30)
+        socks5(sock, host, port)
+    else:
+        sock = socket.create_connection((host, port), timeout=30)
+    sock.settimeout(None)
+    relay(sock)
+
+
+if __name__ == "__main__":
+    main()
+PY
 
 die() { echo "rwth-vpn: $*" >&2; exit 1; }
 is_root() { [ "$(id -u)" -eq 0 ]; }
@@ -55,8 +229,60 @@ elevate_cmd() {
     fi
 }
 
-# shellcheck source=lib/secrets.sh
-. "$LIB_DIR/secrets.sh"
+# Secret storage.
+#
+# macOS: login Keychain (service "rwth-vpn"). Elsewhere: a 0600 file, because
+# keyring daemons (secret-service, gpg-agent) need an unlocked GUI session,
+# which agents on headless machines don't have.
+#
+# Names: user, vpn_password, totp_secret, hpc_user, hpc_password
+
+SECRETS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/secrets"
+
+secret_backend() {
+    if [ "$(uname -s)" = Darwin ] && command -v security >/dev/null 2>&1; then
+        echo keychain
+    else
+        echo file
+    fi
+}
+
+secret_get() {
+    case "$(secret_backend)" in
+        keychain) security find-generic-password -s rwth-vpn -a "$1" -w 2>/dev/null;;
+        file)
+            [ -r "$SECRETS_FILE" ] || return 1
+            # Values are base64 so any character survives the line format.
+            v=$(sed -n "s/^$1=//p" "$SECRETS_FILE" | head -n 1)
+            [ -n "$v" ] || return 1
+            printf '%s' "$v" | base64 -d 2>/dev/null || printf '%s' "$v" | base64 -D
+            ;;
+    esac
+}
+
+# secret_set NAME VALUE (empty VALUE deletes)
+secret_set() {
+    case "$(secret_backend)" in
+        keychain)
+            security delete-generic-password -s rwth-vpn -a "$1" >/dev/null 2>&1
+            # `security` has no reliable non-tty way to read the value, so it
+            # is briefly in argv; this only runs during `rwth-vpn secrets`.
+            [ -z "$2" ] || security add-generic-password -s rwth-vpn -a "$1" -U -w "$2"
+            ;;
+        file)
+            (
+                umask 077
+                mkdir -p "$(dirname "$SECRETS_FILE")"
+                tmp="$SECRETS_FILE.tmp.$$"
+                { [ -r "$SECRETS_FILE" ] && grep -v "^$1=" "$SECRETS_FILE"; } >"$tmp" || true
+                [ -z "$2" ] || printf '%s=%s\n' "$1" "$(printf '%s' "$2" | base64 | tr -d '\n')" >>"$tmp"
+                mv "$tmp" "$SECRETS_FILE"
+            )
+            ;;
+    esac
+}
+
+have_secret() { [ -n "$(secret_get "$1")" ]; }
 
 # Rootless session for ssh: openconnect + ocproxy (userspace TCP/IP) exposing
 # the VPN as a SOCKS5 proxy. Per user, no root, no system routes touched.
@@ -98,7 +324,7 @@ authenticate() {
     [ -n "$user" ] && args+=(--user="$user")
     if [ -n "$user" ] && have_secret vpn_password && have_secret totp_secret; then
         local code
-        code=$(secret_get totp_secret | python3 -I "$LIB_DIR/totp.py" --fresh) || die "cannot compute TOTP code"
+        code=$(secret_get totp_secret | python3 -I -c "$TOTP_PY" --fresh) || die "cannot compute TOTP code"
         { secret_get vpn_password; echo; echo "$code"; } |
             openconnect --authenticate "${args[@]}" "$SERVER" 2>>"${AUTH_LOG:-/dev/null}"
     elif [ ! -t 0 ]; then
@@ -129,10 +355,17 @@ tls_workaround() {
     v=$(openconnect --version 2>&1 | sed -n 's/^OpenConnect version v\{0,1\}\([0-9]*\)\.\([0-9]*\).*/\1 \2/p' | head -n 1)
     read -r major minor <<<"${v:-0 0}"
     [ "$((major * 100 + minor))" -lt 920 ] || return 0
+    local dir=$USER_DIR
+    if is_root; then dir=$RUN_DIR; mkdir -p "$dir"
+    else mkdir -p "$dir" && chmod 700 "$dir"; fi
     if openconnect --version 2>&1 | grep -q 'Using OpenSSL'; then
-        export OPENSSL_CONF="$LIB_DIR/openssl-tls12.cnf"
+        export OPENSSL_CONF=$dir/openssl-tls12.cnf
+        printf '%s\n' 'openssl_conf = default_conf' '[default_conf]' 'ssl_conf = ssl_sect' \
+            '[ssl_sect]' 'system_default = system_default_sect' \
+            '[system_default_sect]' 'MaxProtocol = TLSv1.2' >"$OPENSSL_CONF"
     else
-        export GNUTLS_SYSTEM_PRIORITY_FILE="$LIB_DIR/gnutls-tls12.conf"
+        export GNUTLS_SYSTEM_PRIORITY_FILE=$dir/gnutls-tls12.conf
+        printf '%s\n' '[overrides]' 'disabled-version = tls1.3' >"$GNUTLS_SYSTEM_PRIORITY_FILE"
     fi
 }
 
@@ -278,7 +511,7 @@ cmd__connect() {
     # A fixed name is nice on Linux; macOS needs utunN and the BSDs tunN, so let
     # openconnect pick there.
     local args=("${UA_ARGS[@]}" --cookie-on-stdin --servercert="$fp" --resolve="$resolve"
-                --script="$LIB_DIR/hook.sh" --background --pid-file="$PID_FILE" --timestamp)
+                --script="'$SELF' _hook" --background --pid-file="$PID_FILE" --timestamp)
     [ "$(uname -s)" = Linux ] && args+=(--interface=tun-rwth)
 
     printf '\n=== %s up (%s)\n' "$(date)" "$mode" >>"$LOG_FILE"
@@ -289,6 +522,120 @@ cmd__connect() {
     local n=0
     while [ ! -r "$STATE_FILE" ] && [ $n -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
     cmd_status
+}
+
+# openconnect --script hook (rwth-vpn _hook). Runs as root.
+#
+# full:  stock vpnc-script (default route + DNS via RWTH), plus on Linux:
+#        - Tailscale's underlay (fwmark 0x80000) keeps using the physical uplink,
+#          so direct peers stay direct instead of detouring through Aachen;
+#        - if the VPN hands out no IPv6, native IPv6 is made unreachable so
+#          dual-stack sites (publishers) fall back to IPv4 and see an RWTH address.
+# split: vpn-slice routes the server's split-include networks plus all RWTH ranges.
+#
+# Inputs from rwth-vpn: RWTH_VPN_MODE, RWTH_VPN_VPNC_SCRIPT, RWTH_VPN_STATE,
+# RWTH_VPN_SLICE, RWTH_VPN_SPLIT_ROUTES. Everything else comes from openconnect.
+# shellcheck disable=SC2154,SC2153  # reason, TUNDEV, INTERNAL_IP*: set by openconnect
+
+TABLE=7337          # holds the physical default route(s) for Tailscale
+PREF_MAIN=5200      # must sit before Tailscale's 5210 rule
+PREF_UPLINK=5201
+# IPv6 block: after Tailscale's 5270 (tailnet) rule. It lives in its own table
+# because an unreachable route in main ends IPv6 rule lookup even when
+# suppress_prefixlength should skip it.
+V6_TABLE=7338
+PREF_V6_MAIN=5280
+PREF_V6_BLOCK=5281
+TS_MARK=0x80000/0xff0000
+
+write_state() {
+    cat >"$RWTH_VPN_STATE" <<EOF
+MODE='$RWTH_VPN_MODE'
+TUNDEV='$TUNDEV'
+IP4='$INTERNAL_IP4_ADDRESS'
+IP6='${INTERNAL_IP6_ADDRESS:-}'
+SINCE='$(date '+%Y-%m-%d %H:%M')'
+V6_BLOCKED='${V6_BLOCKED:-}'
+EOF
+}
+
+has_tailscale_rules() {
+    ip rule show 2>/dev/null | grep -q "fwmark $TS_MARK"
+}
+
+# Copy the current physical default route of family $1 into $TABLE and steer
+# Tailscale-marked packets there, ignoring the VPN's default (/0 or /1 routes).
+keep_tailscale_on_uplink() {
+    fam=$1
+    route=$(ip "$fam" route show default table main | head -n 1 | sed 's/ expires [^ ]*//')
+    [ -n "$route" ] || return 0
+    # shellcheck disable=SC2086
+    ip "$fam" route replace $route table $TABLE
+    ip "$fam" rule add pref $PREF_MAIN fwmark $TS_MARK lookup main suppress_prefixlength 1
+    ip "$fam" rule add pref $PREF_UPLINK fwmark $TS_MARK lookup $TABLE
+}
+
+linux_full_cleanup() {
+    for fam in -4 -6; do
+        while ip "$fam" rule del pref $PREF_MAIN 2>/dev/null; do :; done
+        while ip "$fam" rule del pref $PREF_UPLINK 2>/dev/null; do :; done
+        ip "$fam" route flush table $TABLE 2>/dev/null
+    done
+    while ip -6 rule del pref $PREF_V6_MAIN 2>/dev/null; do :; done
+    while ip -6 rule del pref $PREF_V6_BLOCK 2>/dev/null; do :; done
+    ip -6 route flush table $V6_TABLE 2>/dev/null
+    return 0
+}
+
+cmd__hook() {
+    # vpnc-script conventions: plain sh semantics, unset variables allowed.
+    set +eu +o pipefail
+    case "$RWTH_VPN_MODE" in
+    split)
+        case "$reason" in
+            connect) write_state;;
+            disconnect) rm -f "$RWTH_VPN_STATE";;
+        esac
+        # shellcheck disable=SC2086
+        exec "$RWTH_VPN_SLICE" -S -I $RWTH_VPN_SPLIT_ROUTES
+        ;;
+    esac
+
+    # full mode
+    if [ "$(uname -s)" != Linux ]; then
+        case "$reason" in
+            connect) "$RWTH_VPN_VPNC_SCRIPT" && write_state; exit;;
+            disconnect) rm -f "$RWTH_VPN_STATE";;
+        esac
+        exec "$RWTH_VPN_VPNC_SCRIPT"
+    fi
+
+    case "$reason" in
+    connect)
+        linux_full_cleanup
+        # Snapshot uplink routes before vpnc-script replaces the default.
+        if has_tailscale_rules; then
+            keep_tailscale_on_uplink -4
+            keep_tailscale_on_uplink -6
+        fi
+        "$RWTH_VPN_VPNC_SCRIPT" || { rc=$?; linux_full_cleanup; exit $rc; }
+        if [ -z "${INTERNAL_IP6_ADDRESS:-}" ] && ip -6 route show default | grep -q .; then
+            ip -6 route add unreachable default table $V6_TABLE
+            ip -6 rule add pref $PREF_V6_MAIN not fwmark $TS_MARK lookup main suppress_prefixlength 0
+            ip -6 rule add pref $PREF_V6_BLOCK not fwmark $TS_MARK lookup $V6_TABLE
+            V6_BLOCKED=1
+        fi
+        write_state
+        ;;
+    disconnect)
+        "$RWTH_VPN_VPNC_SCRIPT"
+        linux_full_cleanup
+        rm -f "$RWTH_VPN_STATE"
+        ;;
+    *)
+        exec "$RWTH_VPN_VPNC_SCRIPT"
+        ;;
+    esac
 }
 
 # backoff_active MARK: true if MARK was written less than BACKOFF_SECS ago.
@@ -386,11 +733,11 @@ proxy_ensure() {
 cmd__ssh_proxy() {
     local host=$1 port=$2
     if is_running; then
-        exec python3 -I "$LIB_DIR/connect.py" "$host" "$port"
+        exec python3 -I -c "$CONNECT_PY" "$host" "$port"
     fi
     # Subshell: its EXIT trap must drop the lock before exec replaces us.
     (proxy_ensure) >&2
-    exec python3 -I "$LIB_DIR/connect.py" "$host" "$port" "$RWTH_SOCKS_PORT"
+    exec python3 -I -c "$CONNECT_PY" "$host" "$port" "$RWTH_SOCKS_PORT"
 }
 
 # ssh `Match exec` hook: make sure a logged-in master connection exists for
@@ -438,7 +785,7 @@ cmd__ssh_master() {
     # Output goes to a file, not $(...): the backgrounded master (-f) would
     # hold a pipe open for its whole lifetime.
     local out tmp=$USER_DIR/master.out.$$
-    SSH_ASKPASS="$LIB_DIR/askpass.sh" SSH_ASKPASS_REQUIRE=force DISPLAY=${DISPLAY:-:0} \
+    RWTH_VPN_ASKPASS=1 SSH_ASKPASS="$SELF" SSH_ASKPASS_REQUIRE=force DISPLAY=${DISPLAY:-:0} \
         ssh -f -N -M -o BatchMode=no -o NumberOfPasswordPrompts=1 "$host" \
         </dev/null >"$tmp" 2>&1 || true
     out=$(cat "$tmp"); rm -f "$tmp"
@@ -455,6 +802,39 @@ cmd__ssh_master() {
         echo "rwth-vpn: VPN login failed (see $PROXY_LOG); check with 'rwth-vpn test-login'" >&2
     fi
     return 0
+}
+
+# SSH_ASKPASS (this script, with RWTH_VPN_ASKPASS=1): answers the HPC login prompts from stored secrets.
+# ssh passes the prompt text as $1; we print the answer, or fail on prompts we
+# don't recognise so ssh stops instead of sending something wrong.
+
+
+cmd__askpass() {
+    # OpenSSH prefixes "(user@host) "; drop it so a user or host name containing
+    # "otp"/"token" can't change which answer we give.
+    local prompt
+    prompt=$(printf '%s' "$1" | sed 's/^([^)]*) *//' | tr '[:upper:]' '[:lower:]')
+
+    case "$prompt" in
+        # CLAIX asks "Two-factor code:" (before the password).
+        *two-factor*|*two\ factor*|*otp*|*token*|*one-time*|*one\ time*|*second\ factor*|*2fa*|*verification\ code*|*authenticator*)
+            # The HPC has its own TOTP tokens (RegApp), separate from the VPN's.
+            secret_get hpc_totp_secret | python3 -I -c "$TOTP_PY" --fresh
+            ;;
+        *passphrase*)
+            # Key passphrases belong to ssh-agent, not to us.
+            exit 1
+            ;;
+        *password*)
+            # No fallback to the VPN password: a wrong guess counts as a failed login.
+            secret_get hpc_password
+            echo
+            ;;
+        *)
+            echo "rwth-vpn askpass: unrecognised prompt: $1" >&2
+            exit 1
+            ;;
+    esac
 }
 
 cmd_ssh_setup() {
@@ -538,12 +918,12 @@ prompt_secret() {
         esac
         case "$name" in
             *totp_secret)
-                if ! printf '%s' "$v" | python3 -I "$LIB_DIR/totp.py" >/dev/null 2>&1; then
+                if ! printf '%s' "$v" | python3 -I -c "$TOTP_PY" >/dev/null 2>&1; then
                     echo "    That isn't a base32 secret or otpauth:// link; try again ('-' to delete)."
                     continue
                 fi
                 secret_set "$name" "$v"
-                echo "    Current code: $(printf '%s' "$v" | python3 -I "$LIB_DIR/totp.py")  <- should match your phone"
+                echo "    Current code: $(printf '%s' "$v" | python3 -I -c "$TOTP_PY")  <- should match your phone"
                 ;;
             *) secret_set "$name" "$v";;
         esac
@@ -609,7 +989,7 @@ cmd_totp() {
     local name=totp_secret
     [ "${1:-}" = hpc ] && name=hpc_totp_secret
     have_secret "$name" || die "no ${1:+HPC }TOTP secret stored (run 'rwth-vpn secrets')"
-    secret_get "$name" | python3 -I "$LIB_DIR/totp.py"
+    secret_get "$name" | python3 -I -c "$TOTP_PY"
 }
 
 cmd_down() {
@@ -652,6 +1032,14 @@ usage() {
 }
 
 main() {
+    # ssh calling us as SSH_ASKPASS: one argument, the prompt text. (Children of
+    # that ssh inherit the variable, but always pass a subcommand plus args.)
+    if [ -n "${RWTH_VPN_ASKPASS:-}" ] && [ $# -eq 1 ]; then
+        case "$1" in _*|-*|up|down|status|check|secrets|test-login|totp|ssh-setup|help) ;;
+            *) cmd__askpass "$1"; return;;
+        esac
+    fi
+    [ "${1:-}" = _hook ] && { cmd__hook; return; }
     local cmd=${1:-}
     [ $# -gt 0 ] && shift
     load_config
@@ -668,6 +1056,10 @@ main() {
         _connect) cmd__connect "$@";;
         _ssh-proxy) cmd__ssh_proxy "$@";;
         _ssh-master) cmd__ssh_master "$@";;
+        # For the test lab: secrets by name (value on stdin for set), TOTP of stdin.
+        _secret-get) secret_get "$1";;
+        _secret-set) secret_set "$1" "$(cat)";;
+        _totp) python3 -I -c "$TOTP_PY" "$@";;
         -h|--help|help|"") usage;;
         *) usage; exit 2;;
     esac
