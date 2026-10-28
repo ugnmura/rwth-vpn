@@ -27,7 +27,7 @@ func main() {
 	}
 	if len(args) > 0 && args[0] == "__native" {
 		if err := native(args[1:]); err != nil {
-			if errors.Is(err, keyring.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+			if errors.Is(err, keyring.ErrNotFound) {
 				os.Exit(1)
 			}
 			fmt.Fprintln(os.Stderr, "rwth-vpn:", err)

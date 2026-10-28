@@ -84,7 +84,7 @@ Run `rwth-vpn uninstall` to remove the installed binary and its SSH configuratio
 
 ## Supported Platforms
 
-- Release targets: Linux, macOS, FreeBSD, OpenBSD and NetBSD, on amd64 and arm64. Cross-compilation is checked; native CI tests run on Linux and macOS.
+- Release targets: Linux, macOS, FreeBSD, OpenBSD and NetBSD, on amd64 and arm64. Cross-compilation is checked; native validation has run on Linux.
 - Debian, Ubuntu, Fedora: VPN and HPC dependencies are packaged.
 - Arch, Manjaro, openSUSE, Void, Alpine, Gentoo, Solus: optional `ocproxy` is built from source when needed.
 - NixOS: add `openconnect` and, for HPC, `ocproxy` to your config.
