@@ -213,3 +213,6 @@ t_k() {
 
 for t in ${@:-a b c d e f g h i j k}; do "t_$t"; done
 echo "== summary"; printf '%s\n' "${RESULTS[@]}"
+for result in "${RESULTS[@]}"; do
+    case "$result" in *" FAIL") exit 1;; esac
+done

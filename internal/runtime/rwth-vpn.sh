@@ -5,14 +5,15 @@
 #   rwth-vpn down                             disconnect
 #   rwth-vpn status                           show state
 #   rwth-vpn check                            test that the server still accepts openconnect
-#   rwth-vpn secrets [--where]                store logins + TOTP secrets once, with links
-#                                             to where you get them (no more prompts)
+#   rwth-vpn secrets [--mode encrypted|unencrypted] [--no-hpc|--hpc]
+#   rwth-vpn secrets --unlock                 unlock encrypted storage interactively
 #   rwth-vpn test-login                       check the stored VPN secrets
 #   rwth-vpn ssh-setup                        make plain `ssh claix` work (no sudo, no prompts)
+#   rwth-vpn uninstall [--purge]              remove installation; --purge also deletes credentials
 #   rwth-vpn totp [hpc]                       print the current VPN (or HPC) TOTP code
 #
 # Login runs as the invoking user; only the tunnel itself runs as root.
-# Secrets live only where `rwth-vpn secrets` puts them (Keychain / 0600 file);
+# Secrets live only where `rwth-vpn secrets` puts them (keyring / 0600 file);
 # the session cookie is piped straight to openconnect, never stored.
 #
 # Portable to bash 3.2 (macOS) and the BSDs: no readlink -f, seq, getent ahostsv4
@@ -45,180 +46,6 @@ resolve_self() {
 SELF=$(resolve_self "$0")
 
 
-# Python helpers (standard library only), run as python3 -I -c "$X_PY" ARGS.
-read -r -d '' TOTP_PY <<'PY' || true
-"""RFC 6238 TOTP code for the secret on stdin (base32 or an otpauth:// URI).
-
-Reads the secret from stdin so it never shows up in `ps`. Standard library only.
-
-    totp           print the current code
-    totp --fresh   a code valid for >= 5 s that no earlier --fresh call
-                      returned for this secret (waits for the next one if needed)
-
-Servers reject a code that was already accepted (replay), so two logins with
-one token in one 30 s window (e.g. down and up again) must not share a code.
-"""
-import base64
-import fcntl
-import hashlib
-import hmac
-import os
-import struct
-import sys
-import time
-import urllib.parse
-
-MIN_VALIDITY = 5
-
-
-def parse(raw):
-    """Return (key, digits, period, digest) from a base32 secret or otpauth URI."""
-    raw = raw.strip()
-    digits, period, digest = 6, 30, hashlib.sha1
-    if raw.lower().startswith("otpauth://"):
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(raw).query)
-        secret = q["secret"][0]
-        digits = int(q.get("digits", ["6"])[0])
-        period = int(q.get("period", ["30"])[0])
-        digest = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256,
-                  "SHA512": hashlib.sha512}[q.get("algorithm", ["SHA1"])[0].upper()]
-    else:
-        secret = raw
-    secret = secret.replace(" ", "").replace("-", "").upper()
-    if not secret:
-        sys.exit("totp: empty secret")
-    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
-    return key, digits, period, digest
-
-
-def code(key, digits, period, digest, now):
-    mac = hmac.new(key, struct.pack(">Q", int(now) // period), digest).digest()
-    off = mac[-1] & 0x0F
-    n = struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF
-    return str(n % 10 ** digits).zfill(digits)
-
-
-def fresh_time(key, period):
-    """Return a time in a step that is valid long enough and not yet used."""
-    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache")
-    # Per token (VPN and HPC are separate), named by a hash, not the secret.
-    tag = hashlib.sha256(key).hexdigest()[:12]
-    path = os.path.join(base, "rwth-vpn", "totp-%s.last" % tag)
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    with open(path, "a+") as f:
-        # Held while waiting, so parallel callers get successive steps.
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.seek(0)
-        last = f.read().strip()
-        last = int(last) if last.isdigit() else -1
-        while True:
-            now = time.time()
-            left = period - now % period
-            if left >= MIN_VALIDITY and int(now // period) > last:
-                break
-            time.sleep(left + 0.2)
-        f.seek(0)
-        f.truncate()
-        f.write(str(int(now // period)))
-    return now
-
-
-def main():
-    key, digits, period, digest = parse(sys.stdin.read())
-    now = time.time()
-    if "--fresh" in sys.argv[1:]:
-        now = fresh_time(key, period)
-    print(code(key, digits, period, digest, now))
-
-
-if __name__ == "__main__":
-    main()
-PY
-
-read -r -d '' CONNECT_PY <<'PY' || true
-"""ssh ProxyCommand: relay stdin/stdout to HOST:PORT, directly or via SOCKS5.
-
-    connect HOST PORT                 direct TCP (system tunnel is up)
-    connect HOST PORT SOCKS_PORT      through the local ocproxy SOCKS5 proxy
-
-The hostname goes to the proxy unresolved, so the VPN's DNS resolves it.
-Standard library only.
-"""
-import os
-import selectors
-import socket
-import struct
-import sys
-
-
-def socks5(sock, host, port):
-    sock.sendall(b"\x05\x01\x00")
-    if sock.recv(2) != b"\x05\x00":
-        sys.exit("socks: proxy refused no-auth method")
-    h = host.encode()
-    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + struct.pack(">H", port))
-    head = recv_exact(sock, 4)
-    if head[1] != 0:
-        sys.exit(f"socks: connect to {host}:{port} failed (code {head[1]})")
-    # Skip the bound address in the reply.
-    atyp = head[3]
-    n = {1: 4, 4: 16}.get(atyp)
-    if n is None:
-        n = recv_exact(sock, 1)[0]
-    recv_exact(sock, n + 2)
-
-
-def recv_exact(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            sys.exit("socks: proxy closed the connection")
-        buf += chunk
-    return buf
-
-
-def relay(sock):
-    sel = selectors.DefaultSelector()
-    stdin, stdout = sys.stdin.fileno(), sys.stdout.fileno()
-    sel.register(stdin, selectors.EVENT_READ)
-    sel.register(sock, selectors.EVENT_READ)
-    open_ends = 2
-    while open_ends:
-        for key, _ in sel.select():
-            if key.fileobj == stdin:
-                data = os.read(stdin, 65536)
-                if data:
-                    sock.sendall(data)
-                else:
-                    sel.unregister(stdin)
-                    sock.shutdown(socket.SHUT_WR)
-                    open_ends -= 1
-            else:
-                data = sock.recv(65536)
-                if data:
-                    os.write(stdout, data)
-                else:
-                    sel.unregister(sock)
-                    open_ends -= 1
-                    return
-
-
-def main():
-    host, port = sys.argv[1], int(sys.argv[2])
-    if len(sys.argv) > 3:
-        sock = socket.create_connection(("127.0.0.1", int(sys.argv[3])), timeout=30)
-        socks5(sock, host, port)
-    else:
-        sock = socket.create_connection((host, port), timeout=30)
-    sock.settimeout(None)
-    relay(sock)
-
-
-if __name__ == "__main__":
-    main()
-PY
-
 die() { echo "rwth-vpn: $*" >&2; exit 1; }
 is_root() { [ "$(id -u)" -eq 0 ]; }
 
@@ -231,55 +58,47 @@ elevate_cmd() {
 
 # Secret storage.
 #
-# macOS: login Keychain (service "rwth-vpn"). Elsewhere: a 0600 file, because
-# keyring daemons (secret-service, gpg-agent) need an unlocked GUI session,
-# which agents on headless machines don't have.
+# Encrypted: macOS login Keychain or Linux Secret Service over session D-Bus.
+# Unencrypted mode uses a 0600 base64 file.
 #
-# Names: user, vpn_password, totp_secret, hpc_user, hpc_password
+# Names: user, vpn_password, totp_secret, hpc_user, hpc_password, hpc_totp_secret
 
 SECRETS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/secrets"
+STORAGE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/storage-mode"
+PROFILE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/setup-profile"
+SECRET_NAMES="user vpn_password totp_secret hpc_user hpc_password hpc_totp_secret"
 
 secret_backend() {
-    if [ "$(uname -s)" = Darwin ] && command -v security >/dev/null 2>&1; then
+    local mode=${SECRET_MODE_OVERRIDE:-}
+    if [ -z "$mode" ] && [ -f "$STORAGE_FILE" ]; then
+        IFS= read -r mode <"$STORAGE_FILE" || true
+        [ -n "$mode" ] || die "empty credential storage mode in $STORAGE_FILE; refusing to fall back"
+    fi
+    case "$mode" in
+        unencrypted) echo file; return;;
+        encrypted) ;;
+        "")
+            # Preserve pre-existing installations until the user chooses a mode.
+            if [ -f "$SECRETS_FILE" ]; then echo file; return; fi;;
+        *) die "invalid credential storage mode in $STORAGE_FILE";;
+    esac
+    if [ "$(uname -s)" = Darwin ]; then
         echo keychain
+    elif [ "$mode" = encrypted ]; then
+        case "$(uname -s)" in Linux) echo secret-service;; *) die "encrypted storage supports Linux and macOS";; esac
     else
         echo file
     fi
 }
 
+# Bound GUI prompts and unavailable D-Bus services, including unattended SSH.
 secret_get() {
-    case "$(secret_backend)" in
-        keychain) security find-generic-password -s rwth-vpn -a "$1" -w 2>/dev/null;;
-        file)
-            [ -r "$SECRETS_FILE" ] || return 1
-            # Values are base64 so any character survives the line format.
-            v=$(sed -n "s/^$1=//p" "$SECRETS_FILE" | head -n 1)
-            [ -n "$v" ] || return 1
-            printf '%s' "$v" | base64 -d 2>/dev/null || printf '%s' "$v" | base64 -D
-            ;;
-    esac
+    "$SELF" __native secret-get "$(secret_backend)" "$SECRETS_FILE" "$1"
 }
 
-# secret_set NAME VALUE (empty VALUE deletes)
+# Values travel through stdin, never command-line arguments.
 secret_set() {
-    case "$(secret_backend)" in
-        keychain)
-            security delete-generic-password -s rwth-vpn -a "$1" >/dev/null 2>&1
-            # `security` has no reliable non-tty way to read the value, so it
-            # is briefly in argv; this only runs during `rwth-vpn secrets`.
-            [ -z "$2" ] || security add-generic-password -s rwth-vpn -a "$1" -U -w "$2"
-            ;;
-        file)
-            (
-                umask 077
-                mkdir -p "$(dirname "$SECRETS_FILE")"
-                tmp="$SECRETS_FILE.tmp.$$"
-                { [ -r "$SECRETS_FILE" ] && grep -v "^$1=" "$SECRETS_FILE"; } >"$tmp" || true
-                [ -z "$2" ] || printf '%s=%s\n' "$1" "$(printf '%s' "$2" | base64 | tr -d '\n')" >>"$tmp"
-                mv "$tmp" "$SECRETS_FILE"
-            )
-            ;;
-    esac
+    printf '%s' "$2" | "$SELF" __native secret-set "$(secret_backend)" "$SECRETS_FILE" "$1"
 }
 
 have_secret() { [ -n "$(secret_get "$1")" ]; }
@@ -300,7 +119,10 @@ load_config() {
     local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/config"
     # shellcheck disable=SC1090
     [ -r "$cfg" ] && . "$cfg"
-    RWTH_USER=${RWTH_USER:-$(secret_get user || true)}
+    RWTH_USER=${RWTH_USER:-}
+    if [ "${1:-}" != --no-secrets ] && [ -z "$RWTH_USER" ]; then
+        RWTH_USER=$(secret_get user || true)
+    fi
     RWTH_MODE=${RWTH_MODE:-full}
     RWTH_SOCKS_PORT=${RWTH_SOCKS_PORT:-11080}
     # Overridable for testing against another AnyConnect server (e.g. ocserv).
@@ -324,7 +146,7 @@ authenticate() {
     [ -n "$user" ] && args+=(--user="$user")
     if [ -n "$user" ] && have_secret vpn_password && have_secret totp_secret; then
         local code
-        code=$(secret_get totp_secret | python3 -I -c "$TOTP_PY" --fresh) || die "cannot compute TOTP code"
+        code=$(secret_get totp_secret | "$SELF" __native totp --fresh) || die "cannot compute TOTP code"
         { secret_get vpn_password; echo; echo "$code"; } |
             openconnect --authenticate "${args[@]}" "$SERVER" 2>>"${AUTH_LOG:-/dev/null}"
     elif [ ! -t 0 ]; then
@@ -407,22 +229,7 @@ find_vpn_slice() {
 # IPv6 matters: RWTH's ASA has been seen to stop answering a home IPv4 while
 # IPv6 still worked. Bounded, so an unreachable server fails in seconds.
 gateway_addr() {
-    python3 -I - "$SERVER" <<'PY' 2>/dev/null
-import socket, sys
-for fam in (socket.AF_INET, socket.AF_INET6):
-    try:
-        addrs = socket.getaddrinfo(sys.argv[1], 443, fam, socket.SOCK_STREAM)
-    except OSError:
-        continue
-    for *_, sa in addrs:
-        try:
-            socket.create_connection(sa[:2], timeout=4).close()
-        except OSError:
-            continue
-        print(sa[0])
-        sys.exit(0)
-sys.exit(1)
-PY
+    "$SELF" __native gateway "$SERVER"
 }
 
 cmd_check() {
@@ -676,7 +483,7 @@ proxy_stop() {
 }
 
 port_open() {
-    python3 -I -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 2).close()' "$1" 2>/dev/null
+    "$SELF" __native port-open "$1" 2>/dev/null
 }
 
 # Start the rootless session unless it's already up. Non-interactive when
@@ -733,11 +540,11 @@ proxy_ensure() {
 cmd__ssh_proxy() {
     local host=$1 port=$2
     if is_running; then
-        exec python3 -I -c "$CONNECT_PY" "$host" "$port"
+        exec "$SELF" __native connect "$host" "$port"
     fi
     # Subshell: its EXIT trap must drop the lock before exec replaces us.
     (proxy_ensure) >&2
-    exec python3 -I -c "$CONNECT_PY" "$host" "$port" "$RWTH_SOCKS_PORT"
+    exec "$SELF" __native connect "$host" "$port" "$RWTH_SOCKS_PORT"
 }
 
 # ssh `Match exec` hook: make sure a logged-in master connection exists for
@@ -819,7 +626,7 @@ cmd__askpass() {
         # CLAIX asks "Two-factor code:" (before the password).
         *two-factor*|*two\ factor*|*otp*|*token*|*one-time*|*one\ time*|*second\ factor*|*2fa*|*verification\ code*|*authenticator*)
             # The HPC has its own TOTP tokens (RegApp), separate from the VPN's.
-            secret_get hpc_totp_secret | python3 -I -c "$TOTP_PY" --fresh
+            secret_get hpc_totp_secret | "$SELF" __native totp --fresh
             ;;
         *passphrase*)
             # Key passphrases belong to ssh-agent, not to us.
@@ -901,6 +708,101 @@ EOF
 }
 
 # prompt_secret NAME LABEL HIDDEN [DEFAULT_NOTE]
+unlock_secrets() {
+    [ -t 0 ] || die "unlock requires an interactive terminal; run 'rwth-vpn secrets --unlock' over SSH"
+    case "$(secret_backend)" in
+        file) echo "Unencrypted storage needs no unlocking."; return;;
+        keychain)
+            echo "Unlock your login Keychain (enter its password at the security prompt)." >&2
+            security unlock-keychain "$HOME/Library/Keychains/login.keychain-db" ||
+                die "could not unlock login Keychain"
+            ;;
+        secret-service)
+            command -v gnome-keyring-daemon >/dev/null 2>&1 ||
+                die "unlock your Secret Service provider, then retry; automatic terminal unlocking currently supports GNOME Keyring"
+            local password
+            printf 'Login keyring password (hidden): ' >&2
+            IFS= read -r -s password; printf '\n' >&2
+            [ -n "$password" ] || die "a nonempty keyring password is required for encrypted storage"
+            printf '%s' "$password" | gnome-keyring-daemon --unlock --components=secrets >/dev/null ||
+                die "could not unlock GNOME Keyring"
+            unset password
+            ;;
+    esac
+    # Verify actual access, not just that the unlock command returned.
+    storage_probe
+}
+
+storage_probe() {
+    [ "$(secret_backend)" != file ] || return 0
+    echo "Accessing encrypted storage. Approve any keyring prompt; if locked or unavailable, run 'rwth-vpn secrets --unlock'. Headless Linux also needs a running session D-Bus and Secret Service provider." >&2
+    if secret_set storage_check ready && [ "$(secret_get storage_check)" = ready ]; then return; fi
+    if [ -t 0 ]; then
+        local answer
+        printf 'Keyring unavailable. Try unlocking it in this terminal? [y/N] ' >&2
+        IFS= read -r answer || answer=n
+        case "$answer" in [Yy]*) unlock_secrets; return;; esac
+    fi
+    die "encrypted storage unavailable; unlock the keyring and retry (no file fallback)"
+}
+
+select_storage() {
+    local mode=$1 old name value tmp
+    case "$mode" in encrypted|unencrypted) ;; *) die "mode must be encrypted or unencrypted";; esac
+    old=$(secret_backend)
+    # Ensure the source keyring is available before treating missing keys as unset.
+    storage_probe
+    SECRET_MODE_OVERRIDE=$mode storage_probe
+    # Verify every copied value before committing the new mode or deleting originals.
+    if [ "$old" != "$(SECRET_MODE_OVERRIDE=$mode secret_backend)" ]; then
+        for name in $SECRET_NAMES; do
+            if value=$(secret_get "$name"); then :
+            else
+                local status=$?
+                [ "$status" = 1 ] || storage_transfer_failed "cannot read original credentials"
+            fi
+            SECRET_MODE_OVERRIDE=$mode secret_set "$name" "$value" || storage_transfer_failed "credential transfer failed"
+            local copied
+            if copied=$(SECRET_MODE_OVERRIDE=$mode secret_get "$name"); then :
+            else
+                local status=$?
+                [ "$status" = 1 ] && [ -z "$value" ] || storage_transfer_failed "credential verification failed"
+            fi
+            [ "$copied" = "$value" ] || storage_transfer_failed "credential verification failed"
+        done
+    fi
+    (
+        umask 077
+        mkdir -p "$(dirname "$STORAGE_FILE")"
+        tmp=$(mktemp "$STORAGE_FILE.XXXXXXXX")
+        printf '%s\n' "$mode" >"$tmp"
+        mv "$tmp" "$STORAGE_FILE"
+    )
+    if [ "$old" != "$(secret_backend)" ]; then
+        case "$old" in
+            file) rm -f "$SECRETS_FILE";;
+            secret-service)
+                "$SELF" __native secret-purge secret-service || die "mode changed, but old keyring credentials could not be removed";;
+            keychain)
+                "$SELF" __native secret-purge keychain || die "mode changed, but old Keychain credentials could not be removed";;
+        esac
+    fi
+    echo "Credential storage: $mode ($(secret_backend))."
+}
+
+storage_transfer_failed() {
+    # select_storage's local mode is visible here. The destination is inactive;
+    # remove partial copies while keeping the original backend and mode intact.
+    local target
+    target=$(SECRET_MODE_OVERRIDE=$mode secret_backend)
+    if [ "$target" = file ]; then rm -f "$SECRETS_FILE"
+    else
+        "$SELF" __native secret-purge "$target" ||
+            echo "rwth-vpn: could not remove partial copies from $target; unlock it and retry the mode change" >&2
+    fi
+    die "$1; original mode and credentials kept"
+}
+
 prompt_secret() {
     local name=$1 label=$2 hidden=$3 note=${4:-unset} cur v
     cur=$(secret_get "$name" || true)
@@ -918,12 +820,12 @@ prompt_secret() {
         esac
         case "$name" in
             *totp_secret)
-                if ! printf '%s' "$v" | python3 -I -c "$TOTP_PY" >/dev/null 2>&1; then
+                if ! printf '%s' "$v" | "$SELF" __native totp >/dev/null 2>&1; then
                     echo "    That isn't a base32 secret or otpauth:// link; try again ('-' to delete)."
                     continue
                 fi
                 secret_set "$name" "$v"
-                echo "    Current code: $(printf '%s' "$v" | python3 -I -c "$TOTP_PY")  <- should match your phone"
+                echo "    Current code: $(printf '%s' "$v" | "$SELF" __native totp)  <- should match your phone"
                 ;;
             *) secret_set "$name" "$v";;
         esac
@@ -932,15 +834,62 @@ prompt_secret() {
 }
 
 cmd_secrets() {
-    case "${1:-}" in
+    local mode="" want_hpc="" unlock=0 profile=""
+    while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-hpc) want_hpc=0;;
+        --hpc) want_hpc=1;;
+        --unlock) unlock=1;;
+        --mode)
+            [ $# -ge 2 ] || die "--mode needs encrypted or unencrypted"
+            mode=$2
+            case "$mode" in encrypted|unencrypted) ;; *) die "mode must be encrypted or unencrypted";; esac
+            shift;;
         --where|--help|-h)
             secrets_guide_vpn; echo; secrets_guide_hpc
+            echo; echo "Storage: rwth-vpn secrets --mode encrypted|unencrypted"
+            echo "Unlock: rwth-vpn secrets --unlock"
             echo; echo "Run 'rwth-vpn secrets' in a terminal to enter them."
             return 0;;
+        *) die "usage: rwth-vpn secrets [--mode encrypted|unencrypted] [--unlock] [--no-hpc|--hpc]";;
     esac
+    shift
+    done
+    if [ "$unlock" = 1 ]; then
+        if [ -n "$mode" ]; then SECRET_MODE_OVERRIDE=$mode unlock_secrets
+        else unlock_secrets; fi
+        return
+    fi
     [ -t 0 ] || { secrets_guide_vpn; echo; secrets_guide_hpc; die "run 'rwth-vpn secrets' in a terminal to enter them"; }
 
-    echo "Secrets are stored in $( [ "$(secret_backend)" = keychain ] && echo "your macOS Keychain (service rwth-vpn)" || echo "$SECRETS_FILE (mode 0600)")."
+    if [ -z "$mode" ] && [ ! -f "$STORAGE_FILE" ]; then
+        echo "Choose storage: encrypted (Keychain / Secret Service) or unencrypted (0600 file)."
+        printf 'Storage mode [encrypted]: '
+        IFS= read -r mode
+        mode=${mode:-encrypted}
+    fi
+    if [ -n "$mode" ]; then select_storage "$mode"; else storage_probe; fi
+    if [ -z "$want_hpc" ]; then
+        if [ -f "$PROFILE_FILE" ]; then IFS= read -r profile <"$PROFILE_FILE" || true; fi
+        case "$profile" in
+            vpn-only) want_hpc=0;;
+            hpc) want_hpc=1;;
+            *)
+                printf 'Set up HPC credentials and SSH access too? [y/N] '
+                local answer
+                IFS= read -r answer || answer=n
+                case "$answer" in [Yy]*) want_hpc=1;; *) want_hpc=0;; esac;;
+        esac
+    fi
+    if [ "$want_hpc" = 1 ]; then echo hpc >"$PROFILE_FILE"
+    else echo vpn-only >"$PROFILE_FILE"; fi
+    case "$(secret_backend)" in
+        keychain) echo "Secrets are stored in your macOS login Keychain (service rwth-vpn).";;
+        secret-service) echo "Secrets are stored in Linux Secret Service (service rwth-vpn).";;
+        file) echo "Secrets are stored in $SECRETS_FILE (mode 0600, base64 encoded, NOT encrypted).";;
+    esac
+    load_config
+    tls_workaround
     echo "Enter keeps the current value, '-' deletes it. Typing is hidden for passwords and secrets."
     echo
     secrets_guide_vpn
@@ -948,10 +897,12 @@ cmd_secrets() {
     prompt_secret vpn_password "VPN password" 1
     prompt_secret totp_secret "VPN TOTP secret" 1
     echo
-    secrets_guide_hpc
-    prompt_secret hpc_user "HPC username" 0 "same as RWTH"
-    prompt_secret hpc_password "HPC password" 1
-    prompt_secret hpc_totp_secret "HPC TOTP secret" 1
+    if [ "$want_hpc" = 1 ]; then
+        secrets_guide_hpc
+        prompt_secret hpc_user "HPC username" 0 "same as RWTH"
+        prompt_secret hpc_password "HPC password" 1
+        prompt_secret hpc_totp_secret "HPC TOTP secret" 1
+    fi
 
     echo
     if have_secret user && have_secret vpn_password && have_secret totp_secret; then
@@ -966,8 +917,10 @@ cmd_secrets() {
     fi
     rm -f "$VPN_FAIL_MARK" "$HPC_FAIL_MARK"
     # Regenerate: the HPC username goes into the ssh config's User line.
-    cmd_ssh_setup >/dev/null
-    have_secret hpc_password && echo "Next: ssh claix hostname"
+    if [ "$want_hpc" = 1 ]; then
+        cmd_ssh_setup >/dev/null
+        if have_secret hpc_password; then echo "Next: ssh claix hostname"; fi
+    fi
 }
 
 # Log in without starting a tunnel, to check the stored secrets.
@@ -989,7 +942,7 @@ cmd_totp() {
     local name=totp_secret
     [ "${1:-}" = hpc ] && name=hpc_totp_secret
     have_secret "$name" || die "no ${1:+HPC }TOTP secret stored (run 'rwth-vpn secrets')"
-    secret_get "$name" | python3 -I -c "$TOTP_PY"
+    secret_get "$name" | "$SELF" __native totp
 }
 
 cmd_down() {
@@ -1007,6 +960,54 @@ cmd_down() {
     kill -0 "$pid" 2>/dev/null && { kill -TERM "$pid"; sleep 1; }
     rm -f "$PID_FILE"
     echo "disconnected"
+}
+
+cmd_uninstall() {
+    local purge=0 cfg="$HOME/.ssh/config" tmp socket name
+    case "$#:${1:-}" in
+        0:) ;;
+        1:--purge) purge=1;;
+        *) die "usage: rwth-vpn uninstall [--purge]";;
+    esac
+    if is_running; then
+        die "run 'rwth-vpn down' before uninstalling the active whole-machine tunnel"
+    fi
+    # Close persistent SSH masters before removing their proxy configuration.
+    for socket in "$HOME/.ssh/rwth-vpn-cm/"*; do
+        [ -S "$socket" ] || continue
+        ssh -F /dev/null -S "$socket" -O exit claix ||
+            die "could not stop SSH session at $socket; close it before uninstalling"
+    done
+    if proxy_running; then proxy_stop; fi
+    if [ -f "$cfg" ]; then
+        tmp=$(mktemp "$cfg.rwth-vpn.XXXXXXXX")
+        # Remove only the exact Include line written by ssh-setup.
+        if ! awk -v line="Include $SSH_CONF" '$0 != line' "$cfg" >"$tmp"; then
+            rm -f "$tmp"
+            die "could not update $cfg"
+        fi
+        chmod 600 "$tmp"
+        cat "$tmp" >"$cfg"
+        rm -f "$tmp"
+    fi
+    rm -f "$SSH_CONF"
+    rmdir "$HOME/.ssh/rwth-vpn-cm" 2>/dev/null || true
+    if [ "$purge" = 1 ]; then
+        if [ "$(secret_backend)" = secret-service ]; then
+            storage_probe
+            "$SELF" __native secret-purge secret-service || die "could not delete keyring credentials; unlock the keyring and retry"
+        fi
+        if [ "$(secret_backend)" = keychain ]; then
+            "$SELF" __native secret-purge keychain || die "could not delete Keychain credentials; unlock and retry"
+        fi
+        rm -f "$SECRETS_FILE" "$SECRETS_FILE.lock" "$STORAGE_FILE" "$PROFILE_FILE" "${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/config"
+        rmdir "$(dirname "$SECRETS_FILE")" 2>/dev/null || true
+        echo "Credentials and settings deleted."
+    else
+        echo "Credentials and settings kept; use uninstall --purge to delete them before uninstalling."
+    fi
+    rm -f "$SELF"
+    echo "rwth-vpn uninstalled. Dependencies were kept."
 }
 
 cmd_status() {
@@ -1028,21 +1029,29 @@ cmd_status() {
 }
 
 usage() {
-    sed -n '2,16s/^# \{0,1\}//p' "$SELF"
+    "$SELF" __native help
 }
 
 main() {
     # ssh calling us as SSH_ASKPASS: one argument, the prompt text. (Children of
     # that ssh inherit the variable, but always pass a subcommand plus args.)
     if [ -n "${RWTH_VPN_ASKPASS:-}" ] && [ $# -eq 1 ]; then
-        case "$1" in _*|-*|up|down|status|check|secrets|test-login|totp|ssh-setup|help) ;;
+        case "$1" in _*|-*|up|down|status|check|secrets|test-login|totp|ssh-setup|uninstall|help) ;;
             *) cmd__askpass "$1"; return;;
         esac
     fi
     [ "${1:-}" = _hook ] && { cmd__hook; return; }
     local cmd=${1:-}
     [ $# -gt 0 ] && shift
-    load_config
+    # Uninstall also works when dependencies or the user config are broken.
+    [ "$cmd" = uninstall ] && { cmd_uninstall "$@"; return; }
+    # Storage setup/unlock must happen before load_config attempts keyring reads.
+    [ "$cmd" = secrets ] && { cmd_secrets "$@"; return; }
+    case "$cmd" in
+        -h|--help|help|"") usage; return;;
+        up|test-login|ssh-setup|_ssh-proxy|_ssh-master) load_config;;
+        *) load_config --no-secrets;;
+    esac
     tls_workaround
     case "$cmd" in
         up) cmd_up "$@";;
@@ -1059,7 +1068,7 @@ main() {
         # For the test lab: secrets by name (value on stdin for set), TOTP of stdin.
         _secret-get) secret_get "$1";;
         _secret-set) secret_set "$1" "$(cat)";;
-        _totp) python3 -I -c "$TOTP_PY" "$@";;
+        _totp) "$SELF" __native totp "$@";;
         -h|--help|help|"") usage;;
         *) usage; exit 2;;
     esac

@@ -8,12 +8,18 @@ Connect to the RWTH Aachen VPN and the CLAIX HPC cluster from Linux, macOS or BS
 ## Quick Start
 
 ```console
-$ git clone git@github.com:ugnmura/rwth-vpn.git /tmp/rwth-vpn
-$ /tmp/rwth-vpn/install.sh && rm -rf /tmp/rwth-vpn
-$ ssh claix
+$ curl -fsSL https://github.com/ugnmura/rwth-vpn/releases/latest/download/install.sh -o install.sh
+$ sh install.sh
+$ rwth-vpn up
 ```
 
-That's it. `rwth-vpn` is a single self-contained script; the installer copies it to `~/.local/bin` (Homebrew's bin on macOS), so the clone isn't needed afterwards. To update, do the same again. The installer never uses sudo. If a system package is missing, it tells you the command to install it and stops, so you can run that command and rerun the installer.
+Only `install.sh` is needed: it downloads the matching release binary over HTTPS, verifies its SHA-256 checksum, and installs it to `~/.local/bin` (Homebrew's bin on macOS). You can delete `install.sh` afterwards. To update, run the same commands again. With wget, use `wget -O install.sh https://github.com/ugnmura/rwth-vpn/releases/latest/download/install.sh` instead of curl. Each release installer defaults to its own version. To choose a specific release, replace `latest/download` in the URL with `download/v0.1.0`. You can also set `RWTH_VPN_VERSION` when running the installer.
+
+The default is VPN-only. Add `--hpc` for CLAIX access and `--with-split` for optional `vpn-slice` installation. Interactive installs offer HPC setup; `--no-hpc` skips the question. For example: `sh install.sh --hpc --user ab123456`.
+
+Runtime requirements are Bash and openconnect, plus the system's VPN route script and Linux's `ip` command for whole-machine tunnels. There is no Python, Go, or `secret-tool` requirement. HPC additionally needs OpenSSH and `ocproxy`. Split tunneling optionally uses `vpn-slice`, which has its own Python requirements. Linux encrypted storage needs a running Secret Service provider such as GNOME Keyring, reachable over a session D-Bus; unencrypted storage does not.
+
+The installer never uses sudo. If a system package is missing, it tells you the command to install it and stops. It warns if the destination directory is missing from your PATH. From a checkout, run `make build` first; the installer uses `dist/rwth-vpn` when present.
 
 ## Usage
 
@@ -42,7 +48,7 @@ To make split the default, put `RWTH_MODE=split` in `~/.config/rwth-vpn/config`.
 
 ## Secrets
 
-`rwth-vpn secrets` asks for everything and shows where to get each secret. You only need the HPC secrets if you use the HPC.
+`rwth-vpn secrets` lets you choose encrypted or unencrypted storage, and shows where to get each secret. `rwth-vpn secrets --no-hpc` only asks for VPN credentials and skips SSH setup. Use `--hpc` to enable HPC setup later. Existing credentials are retained when skipping HPC.
 
 | Secret | Where to get it |
 |---|---|
@@ -54,17 +60,51 @@ To make split the default, put `RWTH_MODE=split` in `~/.config/rwth-vpn/config`.
 
 When you create a TOTP token, copy the secret text (`JBSWY3DP…`) or the `otpauth://` link. Scan the same QR code with your phone too, so you can still log in by hand. `rwth-vpn totp` (or `rwth-vpn totp hpc`) prints the current code, which should match your phone.
 
-On macOS the secrets are stored in the Keychain. Everywhere else they go in `~/.config/rwth-vpn/secrets` (mode 0600).
+Choose the storage mode explicitly:
+
+```sh
+rwth-vpn secrets --mode encrypted --no-hpc
+rwth-vpn secrets --mode unencrypted --no-hpc
+```
+
+- **Encrypted:** macOS login Keychain or Linux Secret Service, under service `rwth-vpn`. Linux uses D-Bus directly through the bundled Go keyring library. There is no silent fallback to a file.
+- **Unencrypted:** `~/.config/rwth-vpn/secrets` (or `$XDG_CONFIG_HOME/rwth-vpn/secrets`, mode 0600). Values are base64 encoded, not encrypted. This mode works unattended without an unlocked keyring.
+
+Encryption at rest depends on your keyring being protected with a password. The app does not save that unlock password.
+
+Changing modes copies and verifies credentials before saving the new mode and removing the original credentials. Existing installations keep their original backend until you choose a mode. Stored values include usernames, passwords, and TOTP secrets.
+
+If encrypted storage is locked, approve the keyring prompt or run `rwth-vpn secrets --unlock` in a terminal, including over SSH. Before saving encrypted mode for the first time, use `rwth-vpn secrets --mode encrypted --unlock`. Terminal unlocking supports macOS Keychain and GNOME Keyring; other Secret Service providers need their own unlock workflow. Headless Linux needs a running session D-Bus and the same keyring service for setup and later SSH sessions. SSH public-key login does not automatically provide the keyring password. Unattended access fails with unlock guidance if the keyring is unavailable; keyring operations time out rather than hanging indefinitely.
 
 **Be aware:** this machine now holds both factors. Anyone with your user account on it gets your RWTH VPN and HPC access.
 
+## Uninstall
+
+Run `rwth-vpn uninstall` to remove the installed binary and its SSH configuration. Credentials and settings are kept for reinstalling. Use `rwth-vpn uninstall --purge` to also delete stored credentials (including keyring entries) and settings. Stop an active whole-machine tunnel with `rwth-vpn down` first. Uninstall closes the managed SSH sessions and rootless proxy; dependencies and diagnostic cache files are kept.
+
 ## Supported Platforms
 
-- Debian, Ubuntu, Fedora: everything is packaged
-- Arch, Manjaro, openSUSE, Void, Alpine, Gentoo, Solus: `ocproxy` is built from source
-- NixOS: add `openconnect` and `ocproxy` to your config
-- macOS: via Homebrew
-- FreeBSD, OpenBSD, NetBSD: full tunnel only
+- Release targets: Linux, macOS, FreeBSD, OpenBSD and NetBSD, on amd64 and arm64. Cross-compilation is checked; native CI tests run on Linux and macOS.
+- Debian, Ubuntu, Fedora: VPN and HPC dependencies are packaged.
+- Arch, Manjaro, openSUSE, Void, Alpine, Gentoo, Solus: optional `ocproxy` is built from source when needed.
+- NixOS: add `openconnect` and, for HPC, `ocproxy` to your config.
+- macOS: VPN dependencies via Homebrew.
+- BSD: unencrypted storage and full tunnel; encrypted storage currently supports Linux and macOS.
+
+## Development and Releases
+
+Go 1.23+ is required only for development. The executable embeds the existing Bash orchestration and replaces the Python helpers with compiled Go networking, TOTP, and credential storage. It does not extract a script onto disk. TOTP uses [pquerna/otp](https://github.com/pquerna/otp), and encrypted storage uses [go-keyring](https://github.com/zalando/go-keyring). These libraries are compiled into the executable.
+
+```sh
+make build       # dist/rwth-vpn
+make test        # unit and CLI integration tests; no real credentials or VPN needed
+make check       # go vet and shell syntax checks
+sh tests/secret-service.sh dist/rwth-vpn  # optional real, isolated Linux keyring test
+make release VERSION=v0.1.0  # local binaries, pinned installer, and SHA-256 files
+make publish VERSION=v0.1.0  # validate, build locally, push tag, upload release
+```
+
+Releases are built and uploaded locally; no GitHub Actions credits are needed. Update `scripts/release-notes.md`, commit the source, and run `make publish VERSION=v0.1.0` (choose a new version for subsequent releases). Publishing requires Go, Git, Make, and authenticated GitHub CLI (`gh`), and pushes the current branch plus an annotated release tag. The command refuses a dirty working tree or an existing tag and runs checks and tests before building. If uploading fails after the tag is pushed, retry with `gh release create VERSION dist/rwth-vpn_* dist/install.sh dist/install.sh.sha256 --verify-tag --notes-file scripts/release-notes.md`, replacing VERSION with that tag. There are no automatic Actions workflows. Tests cover RFC TOTP vectors, replay prevention, credential permissions and concurrency, keyring errors, storage migration failures, SOCKS framing, VPN-only setup, uninstall, and standalone download/checksum failures. The optional Linux keyring test needs `dbus-run-session` and `gnome-keyring-daemon`, and uses a private bus and temporary home directory. macOS Keychain access and real RWTH connections still need platform testing. The Docker lab tests full tunnels and SSH against local VPN and SSH servers.
 
 ## Why Not Just Use openconnect?
 

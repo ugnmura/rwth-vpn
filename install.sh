@@ -5,17 +5,28 @@
 # root, when you run it.
 # POSIX sh on purpose: Void, Alpine and the BSDs don't ship bash by default.
 #
-#   ./install.sh [--no-split] [--user ab123456]
+#   ./install.sh [--with-split] [--hpc] [--user ab123456]
 
 set -eu
 
-REPO=$(cd "$(dirname "$0")" && pwd)
-WANT_SPLIT=1
+DEFAULT_VERSION=latest
+REPO=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+SOURCE=$REPO/dist/rwth-vpn
+DOWNLOAD_DIR=""
+# Download only when the installer is used without a checkout.
+trap '[ -z "$DOWNLOAD_DIR" ] || rm -rf "$DOWNLOAD_DIR"' 0
+trap 'exit 1' HUP INT TERM
+WANT_SPLIT=0
+WANT_HPC=0
+HPC_CHOICE=0
 RWTH_USER=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-split) WANT_SPLIT=0;;
+        --with-split) WANT_SPLIT=1;;
+        --no-hpc) WANT_HPC=0; HPC_CHOICE=1;;
+        --hpc) WANT_HPC=1; HPC_CHOICE=1;;
         --user) RWTH_USER=${2:?--user needs a value}; shift;;
         *) echo "unknown option: $1" >&2; exit 2;;
     esac
@@ -25,6 +36,12 @@ done
 say() { printf '\n==> %s\n' "$*"; }
 warn() { echo "warning: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+if [ "$HPC_CHOICE" = 0 ] && [ -t 0 ] && [ -t 1 ]; then
+    printf 'Set up HPC access (CLAIX over SSH) too? [y/N] '
+    read -r ans || ans=n
+    case "$ans" in [Yy]*) WANT_HPC=1;; esac
+fi
 
 OS=$(uname -s)
 PM=""
@@ -54,8 +71,6 @@ have_libevent() {
 # separately).
 pkg() {
     case "$1:$PM" in
-        python3:pacman|python3:brew) echo python;;
-        python3:emerge) echo dev-lang/python;;
         openconnect:emerge) echo net-vpn/openconnect;;
         openssh:brew) echo "";;    # macOS ships ssh
         openssh:apt-get|openssh:apk) echo openssh-client;;
@@ -105,20 +120,24 @@ NEED_UP=""   # only needed for `rwth-vpn up`
 add() { NEED="$NEED $(pkg "$1")"; }
 
 have openconnect || add openconnect
-have python3 || add python3
-have ssh || add openssh
+[ "$WANT_HPC" = 0 ] || have ssh || add openssh
 have bash || add bash
 have_vpnc_script || NEED_UP="$NEED_UP $(pkg vpnc-script)"
 [ "$OS" != Linux ] || have ip || NEED_UP="$NEED_UP $(pkg ip)"
 
 OCPROXY=""
-if have ocproxy; then OCPROXY=$(command -v ocproxy)
+if [ "$WANT_HPC" = 0 ]; then :
+elif have ocproxy; then OCPROXY=$(command -v ocproxy)
 elif [ -x "$HOME/.local/bin/ocproxy" ]; then OCPROXY=$HOME/.local/bin/ocproxy
 elif [ -n "$(pkg ocproxy)" ]; then add ocproxy
 elif ! { have cc && have make && have autoconf && have automake && have_libevent; }; then
     NEED="$NEED $(pkg build)"
 fi
-have git || [ -n "$OCPROXY" ] || [ -n "$(pkg ocproxy)" ] || add git
+[ "$WANT_HPC" = 0 ] || have git || [ -n "$OCPROXY" ] || [ -n "$(pkg ocproxy)" ] || add git
+
+# VPN-only installs need whole-machine routing; HPC installs can still use
+# their rootless SSH session when these packages are unavailable.
+if [ "$WANT_HPC" = 0 ]; then NEED="$NEED $NEED_UP"; NEED_UP=""; fi
 
 # Word-split on purpose to trim: these are space-separated package lists.
 # shellcheck disable=SC2086,SC2116
@@ -146,7 +165,46 @@ if [ -n "$NEED_UP" ]; then
 fi
 echo "ok: $(openconnect --version | head -n 1)"
 
-if [ -z "$OCPROXY" ]; then
+if [ ! -f "$SOURCE" ]; then
+    say "Downloading rwth-vpn"
+    DOWNLOAD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rwth-vpn-install.XXXXXXXX")
+    SOURCE=$DOWNLOAD_DIR/rwth-vpn
+    case "$OS" in
+        Linux) platform=linux;; Darwin) platform=darwin;;
+        FreeBSD) platform=freebsd;; OpenBSD) platform=openbsd;; NetBSD) platform=netbsd;;
+        *) echo "No release binary for $OS" >&2; exit 1;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;;
+        *) echo "No release binary for $(uname -m)" >&2; exit 1;;
+    esac
+    asset=rwth-vpn_${platform}_${arch}
+    release=${RWTH_VPN_VERSION:-$DEFAULT_VERSION}
+    base=https://github.com/ugnmura/rwth-vpn/releases
+    if [ "$release" = latest ]; then base=$base/latest/download
+    else base=$base/download/$release; fi
+    download() {
+        if have curl; then curl --fail --show-error --silent --location "$1" -o "$2"
+        elif have wget; then wget -q -O "$2" "$1"
+        else echo "Install curl or wget, then rerun the installer." >&2; return 1; fi
+    }
+    download "$base/$asset" "$SOURCE"
+    download "$base/$asset.sha256" "$DOWNLOAD_DIR/checksum"
+    expected=$(awk 'NR == 1 { print $1 }' "$DOWNLOAD_DIR/checksum")
+    if have sha256sum; then actual=$(sha256sum "$SOURCE")
+    elif have shasum; then actual=$(shasum -a 256 "$SOURCE")
+    elif have sha256; then actual=$(sha256 -q "$SOURCE")
+    elif have openssl; then actual=$(openssl dgst -sha256 -r "$SOURCE")
+    else echo "SHA-256 verification requires sha256sum, shasum, sha256, or openssl." >&2; exit 1; fi
+    actual=${actual%% *}
+    if [ ${#expected} -ne 64 ] || [ "$expected" != "$actual" ]; then
+        echo "Release checksum mismatch; installation stopped." >&2; exit 1
+    fi
+    chmod 755 "$SOURCE"
+fi
+"$SOURCE" --version
+
+if [ "$WANT_HPC" = 1 ] && [ -z "$OCPROXY" ]; then
     say "Building ocproxy into ~/.local/bin (rootless VPN session for ssh)"
     src=${XDG_CACHE_HOME:-$HOME/.cache}/rwth-vpn-build/ocproxy
     rm -rf "$src" && mkdir -p "$(dirname "$src")"
@@ -187,13 +245,17 @@ say "Installing rwth-vpn into PATH"
 BIN=$HOME/.local/bin
 if have brew && [ -w "$(brew --prefix)/bin" ]; then BIN=$(brew --prefix)/bin; fi
 mkdir -p "$BIN"
-# A copy, not a link: the script is self-contained, so the clone can go.
-rm -f "$BIN/rwth-vpn"
-cp "$REPO/rwth-vpn" "$BIN/rwth-vpn" && chmod 755 "$BIN/rwth-vpn"
+# Replace atomically, keeping a working installation if copying fails.
+staged=$(mktemp "$BIN/.rwth-vpn.XXXXXXXX")
+if cp "$SOURCE" "$staged" && chmod 755 "$staged"; then
+    mv -f "$staged" "$BIN/rwth-vpn"
+else
+    rm -f "$staged"; exit 1
+fi
 echo "installed $BIN/rwth-vpn"
 case ":$PATH:" in
     *":$BIN:"*) ;;
-    *) warn "$BIN is not on your PATH; add it in your shell profile (ssh works regardless)";;
+    *) warn "$BIN is not on your PATH; add it in your shell profile";;
 esac
 
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/rwth-vpn/config"
@@ -203,8 +265,14 @@ if [ -n "$RWTH_USER" ] && [ ! -e "$CFG" ]; then
     echo "wrote $CFG"
 fi
 
-say "Setting up ssh for the RWTH HPC"
-"$BIN/rwth-vpn" ssh-setup
+mkdir -p "$(dirname "$CFG")"
+if [ "$WANT_HPC" = 1 ]; then
+    echo hpc >"$(dirname "$CFG")/setup-profile"
+    say "Setting up ssh for the RWTH HPC"
+    "$BIN/rwth-vpn" ssh-setup
+else
+    echo vpn-only >"$(dirname "$CFG")/setup-profile"
+fi
 
 say "Checking the server"
 "$BIN/rwth-vpn" check || true
@@ -218,8 +286,10 @@ fi
 cat <<EOF
 
 Done.
-  ssh claix             HPC login: no sudo, no prompts (VPN starts on demand)
   rwth-vpn up           whole machine via RWTH (papers; asks for sudo)
   rwth-vpn up --split   only RWTH networks via the VPN
   rwth-vpn status | down | secrets | totp
 EOF
+if [ "$WANT_HPC" = 1 ]; then
+    echo "  ssh claix             HPC login: no sudo, no prompts (VPN starts on demand)"
+fi
