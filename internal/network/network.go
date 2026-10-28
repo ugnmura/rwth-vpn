@@ -1,4 +1,5 @@
-package main
+// Package network handles gateway discovery and direct or SOCKS5 SSH relays.
+package network
 
 import (
 	"context"
@@ -19,6 +20,7 @@ func validPort(port string) error {
 	}
 	return nil
 }
+
 func socksHandshake(conn net.Conn, host, port string) error {
 	if len(host) == 0 || len(host) > 255 {
 		return errors.New("SOCKS hostname must be 1 to 255 bytes")
@@ -70,6 +72,7 @@ func socksHandshake(conn net.Conn, host, port string) error {
 	_, err := io.CopyN(io.Discard, conn, int64(n+2))
 	return err
 }
+
 func writeAll(w io.Writer, data []byte) error {
 	for len(data) > 0 {
 		n, err := w.Write(data)
@@ -83,6 +86,7 @@ func writeAll(w io.Writer, data []byte) error {
 	}
 	return nil
 }
+
 func relay(conn net.Conn, in io.Reader, out io.Writer) error {
 	// Input may be a terminal/pipe that never closes. Return on remote EOF,
 	// without waiting for that reader; the standalone helper then exits.
@@ -102,7 +106,9 @@ func relay(conn net.Conn, in io.Reader, out io.Writer) error {
 	_, err := io.Copy(out, conn)
 	return err
 }
-func connect(host, port, proxy string, in io.Reader, out io.Writer) error {
+
+// Connect relays streams to a target, optionally through a local SOCKS5 port.
+func Connect(host, port, proxy string, in io.Reader, out io.Writer) error {
 	if err := validPort(port); err != nil {
 		return err
 	}
@@ -131,7 +137,9 @@ func connect(host, port, proxy string, in io.Reader, out io.Writer) error {
 	}
 	return relay(conn, in, out)
 }
-func portOpen(port string) error {
+
+// PortOpen checks whether a local TCP port accepts a connection.
+func PortOpen(port string) error {
 	if err := validPort(port); err != nil {
 		return err
 	}
@@ -141,7 +149,9 @@ func portOpen(port string) error {
 	}
 	return conn.Close()
 }
-func gateway(ctx context.Context, host string) (string, error) {
+
+// Gateway finds a reachable HTTPS address, preferring IPv4 over IPv6.
+func Gateway(ctx context.Context, host string) (string, error) {
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return "", err

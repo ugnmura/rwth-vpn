@@ -1,4 +1,5 @@
-package main
+// Package totp generates codes and reserves fresh time steps for automatic logins.
+package totp
 
 import (
 	"crypto/sha256"
@@ -12,8 +13,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/ugnmura/rwth-vpn/internal/filelock"
 
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/hotp"
@@ -78,21 +80,11 @@ func parseToken(raw string) (token, error) {
 	t.key = key
 	return t, nil
 }
+
 func (t token) code(now time.Time) (string, error) {
 	return hotp.GenerateCodeCustom(t.secret, uint64(now.Unix()/t.period), hotp.ValidateOpts{Digits: t.digits, Algorithm: t.algorithm})
 }
-func lockFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return f, nil
-}
-func unlockFile(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
+
 func (t token) freshTime() (time.Time, error) {
 	base := os.Getenv("XDG_RUNTIME_DIR")
 	if base == "" {
@@ -108,11 +100,11 @@ func (t token) freshTime() (time.Time, error) {
 	}
 	hash := sha256.Sum256(t.key)
 	tag := hex.EncodeToString(hash[:])[:12]
-	f, err := lockFile(filepath.Join(dir, "totp-"+tag+".last"))
+	f, err := filelock.Acquire(filepath.Join(dir, "totp-"+tag+".last"))
 	if err != nil {
 		return time.Time{}, err
 	}
-	defer unlockFile(f)
+	defer filelock.Release(f)
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return time.Time{}, err
@@ -144,26 +136,20 @@ func (t token) freshTime() (time.Time, error) {
 	}
 	return now, f.Sync()
 }
-func printTOTP(r io.Reader, w io.Writer, fresh bool) error {
-	raw, err := readSecret(r)
-	if err != nil {
-		return err
-	}
+
+// Generate returns a TOTP code. Fresh reserves a time step so concurrent
+// automatic logins cannot reuse the same code.
+func Generate(raw string, fresh bool) (string, error) {
 	t, err := parseToken(raw)
 	if err != nil {
-		return err
+		return "", err
 	}
 	now := time.Now()
 	if fresh {
 		now, err = t.freshTime()
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
-	code, err := t.code(now)
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintln(w, code)
-	return err
+	return t.code(now)
 }

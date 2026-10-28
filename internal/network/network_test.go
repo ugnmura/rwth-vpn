@@ -1,4 +1,4 @@
-package main
+package network
 
 import (
 	"bytes"
@@ -58,6 +58,7 @@ func TestSOCKSFragmentedReply(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestSOCKSRejectsInvalidTargets(t *testing.T) {
 	for _, host := range []string{"", strings.Repeat("x", 256)} {
 		if err := socksHandshake(nil, host, "22"); err == nil {
@@ -68,6 +69,7 @@ func TestSOCKSRejectsInvalidTargets(t *testing.T) {
 		t.Fatal("accepted invalid port")
 	}
 }
+
 func TestSOCKSRejectsAuthentication(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
@@ -80,6 +82,7 @@ func TestSOCKSRejectsAuthentication(t *testing.T) {
 		t.Fatal("accepted authentication rejection")
 	}
 }
+
 func TestRelayWritesAllOutput(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

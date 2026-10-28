@@ -1,9 +1,8 @@
-package main
+package totp
 
 import (
 	"encoding/base32"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 )
@@ -35,6 +34,7 @@ func TestRFC6238(t *testing.T) {
 		}
 	}
 }
+
 func TestRejectInvalidTokens(t *testing.T) {
 	for _, raw := range []string{"", "not!base32", "otpauth://hotp/test?secret=JBSWY3DP", "otpauth://totp/test?secret=JBSWY3DP&digits=99", "otpauth://totp/test?secret=JBSWY3DP&period=0", "otpauth://totp/test?secret=JBSWY3DP&algorithm=MD5"} {
 		if _, err := parseToken(raw); err == nil {
@@ -42,6 +42,7 @@ func TestRejectInvalidTokens(t *testing.T) {
 		}
 	}
 }
+
 func TestPaddedAndUnpaddedTokens(t *testing.T) {
 	a, err := parseToken("mzxw-6===")
 	if err != nil {
@@ -57,6 +58,7 @@ func TestPaddedAndUnpaddedTokens(t *testing.T) {
 		t.Fatalf("padding changed code: %s != %s", x, y)
 	}
 }
+
 func TestFreshCodesAreNotReused(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	token, err := parseToken("otpauth://totp/test?secret=JBSWY3DPEHPK3PXP&period=5")
@@ -73,10 +75,5 @@ func TestFreshCodesAreNotReused(t *testing.T) {
 	}
 	if second.Unix()/5 <= first.Unix()/5 {
 		t.Fatal("reused a TOTP time step")
-	}
-}
-func TestCredentialSizeLimit(t *testing.T) {
-	if _, err := readSecret(strings.NewReader(strings.Repeat("x", 1024*1024+1))); err == nil {
-		t.Fatal("accepted oversized credential")
 	}
 }

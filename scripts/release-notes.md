@@ -1,11 +1,13 @@
-A single downloadable executable for RWTH VPN access, with optional CLAIX HPC setup.
+Refactored source layout and a command line that explains itself.
 
-- No Python, Go compiler, or secret-tool required at runtime. Bash, openconnect, and system routing tools remain required.
-- Encrypted credentials use Linux Secret Service or macOS Keychain; unencrypted storage uses a mode-0600 file.
-- VPN-only installation is the default. HPC and split tunneling are opt-in.
-- Includes credential migration, interactive unlock guidance, and uninstall with optional credential purge.
-- The attached install.sh selects the matching release binary and verifies its SHA-256 checksum.
+- Go code now lives under cmd/rwth-vpn and focused internal packages; integration tests live under tests/integration.
+- Command options use Go's built-in flag parser, with generated usage and option listings. No new dependencies.
+- Use rwth-vpn COMMAND --help or rwth-vpn help TOPIC for credential storage, unlocking, SSH setup, configuration, and troubleshooting.
+- Invalid arguments and help are handled before loading configuration or accessing credentials.
+- The installer now supports --help. The README is a short install/build/release guide.
 
-Download install.sh and run `sh install.sh`. Add `--hpc` for CLAIX or `--with-split` for optional vpn-slice installation.
+Download the attached install.sh and run `sh install.sh`. Add `--hpc` for CLAIX access. The installer selects v0.1.1 and verifies the matching binary's SHA-256 checksum.
 
-Validated on Linux with race tests, an isolated real Secret Service, and all 11 Docker VPN/SSH integration cases. macOS and BSD binaries are cross-compiled; native runtime validation remains outstanding.
+Runtime requirements remain Bash, openconnect, and system routing tools. No Python, Go compiler, or secret-tool is required by the executable.
+
+Linux validation includes race tests, a real isolated Secret Service, and the full Docker VPN/SSH suite. All ten OS/architecture targets are cross-compiled; native macOS/BSD validation remains outstanding.

@@ -1,4 +1,4 @@
-package main
+package credentials
 
 import (
 	"errors"
@@ -40,10 +40,11 @@ func TestFileCredentialsRoundTrip(t *testing.T) {
 		t.Fatalf("deleted key: %v", err)
 	}
 }
+
 func TestConcurrentFileWrites(t *testing.T) {
 	s := fileStore{filepath.Join(t.TempDir(), "secrets")}
 	var wg sync.WaitGroup
-	for _, name := range secretNames {
+	for _, name := range []string{"user", "vpn_password", "totp_secret", "hpc_user", "hpc_password", "hpc_totp_secret", "storage_check"} {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
@@ -53,13 +54,14 @@ func TestConcurrentFileWrites(t *testing.T) {
 		}(name)
 	}
 	wg.Wait()
-	for _, name := range secretNames {
+	for _, name := range []string{"user", "vpn_password", "totp_secret", "hpc_user", "hpc_password", "hpc_totp_secret", "storage_check"} {
 		got, err := s.Get(name)
 		if err != nil || got != name {
 			t.Errorf("lost concurrent key %s: %q %v", name, got, err)
 		}
 	}
 }
+
 func TestCorruptFilePreserved(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "secrets")
 	original := "vpn_password=%%%\n"
@@ -74,6 +76,7 @@ func TestCorruptFilePreserved(t *testing.T) {
 		t.Fatal("corrupt file was changed")
 	}
 }
+
 func TestEncryptedStore(t *testing.T) {
 	keyring.MockInit()
 	s := encryptedStore{}
@@ -94,6 +97,7 @@ func TestEncryptedStore(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestEncryptedFailureGivesUnlockInstructions(t *testing.T) {
 	keyring.MockInitWithError(errors.New("collection is locked"))
 	defer keyring.MockInit()

@@ -1,23 +1,6 @@
 #!/usr/bin/env bash
-# rwth-vpn: connect to the RWTH Aachen VPN with openconnect, Tailscale-style.
-#
-#   rwth-vpn up [--split] [--user ab123456]   connect (prompts for VPN password + TOTP)
-#   rwth-vpn down                             disconnect
-#   rwth-vpn status                           show state
-#   rwth-vpn check                            test that the server still accepts openconnect
-#   rwth-vpn secrets [--mode encrypted|unencrypted] [--no-hpc|--hpc]
-#   rwth-vpn secrets --unlock                 unlock encrypted storage interactively
-#   rwth-vpn test-login                       check the stored VPN secrets
-#   rwth-vpn ssh-setup                        make plain `ssh claix` work (no sudo, no prompts)
-#   rwth-vpn uninstall [--purge]              remove installation; --purge also deletes credentials
-#   rwth-vpn totp [hpc]                       print the current VPN (or HPC) TOTP code
-#
-# Login runs as the invoking user; only the tunnel itself runs as root.
-# Secrets live only where `rwth-vpn secrets` puts them (keyring / 0600 file);
-# the session cookie is piped straight to openconnect, never stored.
-#
-# Portable to bash 3.2 (macOS) and the BSDs: no readlink -f, seq, getent ahostsv4
-# or empty "${arr[@]}" expansions under set -u.
+# Embedded VPN orchestration. Public options and help live in internal/cli.
+# Keep compatible with Bash 3.2 (macOS).
 
 set -euo pipefail
 

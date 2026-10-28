@@ -4,7 +4,7 @@ VERSION ?= dev
 
 build:
 	@mkdir -p dist
-	CGO_ENABLED=0 go build -trimpath -ldflags '-s -w -X main.version=$(VERSION)' -o dist/rwth-vpn .
+	CGO_ENABLED=0 go build -trimpath -ldflags '-s -w -X main.version=$(VERSION)' -o dist/rwth-vpn ./cmd/rwth-vpn
 
 test:
 	go test ./...

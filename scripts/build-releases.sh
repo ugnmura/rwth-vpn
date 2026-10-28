@@ -13,7 +13,7 @@ for os in linux darwin freebsd openbsd netbsd; do
     for arch in amd64 arm64; do
         asset=rwth-vpn_${os}_${arch}
         CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
-            -ldflags "-s -w -X main.version=$version" -o "dist/$asset" .
+            -ldflags "-s -w -X main.version=$version" -o "dist/$asset" ./cmd/rwth-vpn
         (cd dist && if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
         else

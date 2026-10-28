@@ -23,6 +23,25 @@ RWTH_USER=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        -h|--help)
+            cat <<'EOF'
+Usage: sh install.sh [options]
+
+Install the release binary for your platform; VPN-only is the default.
+
+  --hpc          Set up optional CLAIX SSH access and dependencies
+  --no-hpc       Skip HPC setup and its interactive question
+  --with-split   Optionally install vpn-slice (needs Python via uv/pipx)
+  --no-split     Skip vpn-slice installation (default)
+  --user NAME    Preconfigure your RWTH username
+  -h, --help     Show this help
+
+The installer never uses sudo. Missing system packages are listed for you to
+install. The binary needs Bash and openconnect plus system VPN routing tools.
+RWTH_VPN_VERSION overrides the release version. Run again to update.
+After installing, run rwth-vpn --help for usage and credential setup.
+EOF
+            exit 0;;
         --no-split) WANT_SPLIT=0;;
         --with-split) WANT_SPLIT=1;;
         --no-hpc) WANT_HPC=0; HPC_CHOICE=1;;
