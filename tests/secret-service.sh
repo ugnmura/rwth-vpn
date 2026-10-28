@@ -1,7 +1,12 @@
 #!/bin/sh
 # Real Secret Service integration, isolated from your session and keyrings.
-# Requires dbus-run-session and gnome-keyring-daemon, only for this test.
+# Requires dbus-run-session, dbus-send and gnome-keyring-daemon, only for this test.
 set -eu
+for dependency in dbus-run-session dbus-send gnome-keyring-daemon; do
+    command -v "$dependency" >/dev/null 2>&1 || {
+        echo "Missing test dependency: $dependency" >&2; exit 1
+    }
+done
 if [ "${2:-}" != inner ]; then
     binary=$(cd "$(dirname "${1:-dist/rwth-vpn}")" && pwd)/$(basename "${1:-dist/rwth-vpn}")
     test_home=$(mktemp -d "${TMPDIR:-/tmp}/rwth-vpn-keyring.XXXXXXXX")
@@ -21,6 +26,20 @@ printf '%s' 'rwth-vpn-test-keyring-password' |
     gnome-keyring-daemon --foreground --unlock --components=secrets >"$HOME/daemon.log" 2>&1 &
 daemon=$!
 trap 'kill "$daemon" 2>/dev/null || true; wait "$daemon" 2>/dev/null || true' 0
+# Query the bus itself without activating Secret Service. Calling the client
+# too early can auto-start a competing daemon while the login keyring is being
+# created, corrupting this test's temporary keyring.
+n=0
+until dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+    string:org.freedesktop.secrets | grep -q 'boolean true'; do
+    n=$((n + 1))
+    if ! kill -0 "$daemon" 2>/dev/null || [ "$n" -ge 50 ]; then
+        cat "$HOME/daemon.log" >&2
+        echo 'FAIL: test keyring did not acquire its D-Bus name' >&2; exit 1
+    fi
+    sleep 0.1
+done
 n=0
 while ! printf '%s' 'test-vpn-password' | "$binary" __native secret-set secret-service unused vpn_password 2>"$HOME/error"; do
     n=$((n + 1))
