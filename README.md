@@ -9,9 +9,7 @@ Personal tool. Tested on Linux. RWTH can change things at any time.
 Requires Bash, openconnect and system VPN routing tools. The installer lists missing packages.
 
 ```sh
-curl -fsSL https://github.com/ugnmura/rwth-vpn/releases/latest/download/install.sh -o install.sh
-sh install.sh
-rwth-vpn --help
+sh -c "$(curl -fsSL https://github.com/ugnmura/rwth-vpn/releases/latest/download/install.sh)"
 ```
 
 ## Build
