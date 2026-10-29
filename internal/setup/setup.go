@@ -145,7 +145,7 @@ func Run(ui UI, paths Paths, opts Options) (Result, error) {
 	}
 	ui.Summary(summary)
 	ui.Summary([]string{"After saving, the CLI will test VPN credentials and, if enabled, HPC login."})
-	confirm, err := ui.Choose("Save these changes?", []string{"Cancel — keep existing settings", "Save these changes"}, 0)
+	confirm, err := ui.Choose("Save these changes?", []string{"Cancel — keep existing settings", "Save these changes"}, 1)
 	if err != nil {
 		return canceled(err)
 	}
