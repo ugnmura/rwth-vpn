@@ -2,6 +2,8 @@ package network
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -95,5 +97,36 @@ func TestRelayWritesAllOutput(t *testing.T) {
 	}
 	if !bytes.Equal(output.Bytes(), payload) {
 		t.Fatal("relay lost output")
+	}
+}
+
+func TestReachableAddress(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			conn.Close()
+		}
+	}()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := reachableAddress(context.Background(), net.JoinHostPort("localhost", port))
+	if err != nil || address != "127.0.0.1" {
+		t.Fatalf("resolved gateway: %s %v", address, err)
+	}
+}
+
+func TestReachableAddressHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := reachableAddress(ctx, "localhost:443")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
 	}
 }

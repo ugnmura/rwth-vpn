@@ -150,24 +150,18 @@ func PortOpen(port string) error {
 	return conn.Close()
 }
 
-// Gateway finds a reachable HTTPS address, preferring IPv4 over IPv6.
+// Gateway finds a reachable HTTPS address using Go's IPv4/IPv6 fast fallback.
 func Gateway(ctx context.Context, host string) (string, error) {
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	return reachableAddress(ctx, net.JoinHostPort(host, "443"))
+}
+
+func reachableAddress(ctx context.Context, address string) (string, error) {
+	dialer := net.Dialer{Timeout: 4 * time.Second, FallbackDelay: 250 * time.Millisecond}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("cannot reach %s: %w", address, err)
 	}
-	for _, ipv4 := range []bool{true, false} {
-		for _, addr := range addrs {
-			if (addr.IP.To4() != nil) != ipv4 {
-				continue
-			}
-			d := net.Dialer{Timeout: 4 * time.Second}
-			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), "443"))
-			if err == nil {
-				conn.Close()
-				return addr.String(), nil
-			}
-		}
-	}
-	return "", fmt.Errorf("%s is unreachable on port 443", host)
+	defer conn.Close()
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	return host, err
 }

@@ -2,6 +2,7 @@
 package totp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/hex"
@@ -86,6 +87,10 @@ func (t token) code(now time.Time) (string, error) {
 }
 
 func (t token) freshTime() (time.Time, error) {
+	return t.freshTimeContext(context.Background())
+}
+
+func (t token) freshTimeContext(ctx context.Context) (time.Time, error) {
 	base := os.Getenv("XDG_RUNTIME_DIR")
 	if base == "" {
 		home, err := os.UserHomeDir()
@@ -100,7 +105,7 @@ func (t token) freshTime() (time.Time, error) {
 	}
 	hash := sha256.Sum256(t.key)
 	tag := hex.EncodeToString(hash[:])[:12]
-	f, err := filelock.Acquire(filepath.Join(dir, "totp-"+tag+".last"))
+	f, err := filelock.AcquireContext(ctx, filepath.Join(dir, "totp-"+tag+".last"))
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -122,8 +127,17 @@ func (t token) freshTime() (time.Time, error) {
 		return time.Time{}, errors.New("TOTP replay state is in the future; check the system clock")
 	}
 	for t.period-now.Unix()%t.period < 5 || now.Unix()/t.period <= last {
-		time.Sleep(time.Duration(t.period-now.Unix()%t.period)*time.Second + 200*time.Millisecond)
+		timer := time.NewTimer(time.Duration(t.period-now.Unix()%t.period)*time.Second + 200*time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return time.Time{}, ctx.Err()
+		case <-timer.C:
+		}
 		now = time.Now()
+	}
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
 	}
 	if err := f.Truncate(0); err != nil {
 		return time.Time{}, err
@@ -140,13 +154,21 @@ func (t token) freshTime() (time.Time, error) {
 // Generate returns a TOTP code. Fresh reserves a time step so concurrent
 // automatic logins cannot reuse the same code.
 func Generate(raw string, fresh bool) (string, error) {
+	return GenerateContext(context.Background(), raw, fresh)
+}
+
+// GenerateContext stops waiting for an unused code when authentication ends.
+func GenerateContext(ctx context.Context, raw string, fresh bool) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	t, err := parseToken(raw)
 	if err != nil {
 		return "", err
 	}
 	now := time.Now()
 	if fresh {
-		now, err = t.freshTime()
+		now, err = t.freshTimeContext(ctx)
 		if err != nil {
 			return "", err
 		}
