@@ -56,8 +56,18 @@ func (s fileStore) Get(name string) (string, error) {
 func (s fileStore) Set(name, value string) error { return s.update(name, value, false) }
 func (s fileStore) Delete(name string) error     { return s.update(name, "", true) }
 func (s fileStore) update(name, value string, remove bool) error {
-	if name == "" || strings.ContainsAny(name, "=\r\n") {
-		return errors.New("invalid credential name")
+	changes := map[string]*string{name: &value}
+	if remove {
+		changes[name] = nil
+	}
+	return s.apply(changes)
+}
+
+func (s fileStore) apply(changes map[string]*string) error {
+	for name := range changes {
+		if name == "" || strings.ContainsAny(name, "=\r\n") {
+			return errors.New("invalid credential name")
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
 		return err
@@ -72,11 +82,14 @@ func (s fileStore) update(name, value string, remove bool) error {
 	if err != nil {
 		return err
 	}
-	if remove {
-		delete(values, name)
-	} else {
-		values[name] = value
+	for name, value := range changes {
+		if value == nil {
+			delete(values, name)
+		} else {
+			values[name] = *value
+		}
 	}
+
 	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".secrets-*")
 	if err != nil {
 		return err
