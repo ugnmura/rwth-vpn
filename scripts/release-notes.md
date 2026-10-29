@@ -1,13 +1,12 @@
-Refactored source layout and a command line that explains itself.
+Interactive setup, safer credential updates, and VPN/SSH recovery fixes.
 
-- Go code now lives under cmd/rwth-vpn and focused internal packages; integration tests live under tests/integration.
-- Command options use Go's built-in flag parser, with generated usage and option listings. No new dependencies.
-- Use rwth-vpn COMMAND --help or rwth-vpn help TOPIC for credential storage, unlocking, SSH setup, configuration, and troubleshooting.
-- Invalid arguments and help are handled before loading configuration or accessing credentials.
-- The installer now supports --help. The README is a short install/build/release guide.
+- Run rwth-vpn for the menu. Select with a number, arrow keys, or j/k.
+- Credential edits stay in memory until the final save confirmation. After saving, setup tests VPN login and optional HPC login.
+- Agents can preview and apply a private setup profile with rwth-vpn configure. See docs/AGENTS.md for secure human input and confirmation.
+- TLS-only VPN transport is now the default; --dtls opts into UDP transport. Disconnect restores saved routing and DNS after an unexpected VPN exit.
+- SSH detects masters from an earlier VPN session and reconnects. Gateway dialing uses IPv4/IPv6 fallback, and authentication waits can be canceled.
+- Help uses conventional double-dash options. The README includes installation and connect/disconnect examples.
 
-Download the attached install.sh and run `sh install.sh`. Add `--hpc` for CLAIX access. The installer selects v0.1.1 and verifies the matching binary's SHA-256 checksum.
+Run the attached install.sh with Bash/openconnect and system VPN routing tools installed. The installer selects v0.1.2 and verifies the binary's SHA-256 checksum.
 
-Runtime requirements remain Bash, openconnect, and system routing tools. No Python, Go compiler, or secret-tool is required by the executable.
-
-Linux validation includes race tests, a real isolated Secret Service, and the full Docker VPN/SSH suite. All ten OS/architecture targets are cross-compiled; native macOS/BSD validation remains outstanding.
+Linux validation includes Go race tests, isolated Secret Service tests, and Docker VPN/SSH regression checks. Release binaries are cross-compiled for Linux, macOS, FreeBSD, OpenBSD, and NetBSD on amd64 and arm64. Native macOS/BSD validation remains outstanding.

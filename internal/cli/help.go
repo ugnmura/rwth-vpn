@@ -59,7 +59,10 @@ If the VPN process exits unexpectedly, down restores its saved routing/DNS.
 Enter keeps a value; '-' stages its removal. --where explains where to get credentials.
 Edits stay in memory until the final Save changes confirmation. Cancel, Ctrl-C,
 or closing input keeps credentials, storage mode and HPC preferences unchanged.
-Use arrow keys to choose storage; limited terminals use numbered choices.
+After saving, VPN credentials are tested, followed by HPC login when enabled.
+Failed verification keeps the saved changes and returns an error.
+Press a number to select immediately, or use arrows/j/k and Enter.
+Limited terminals use numbered choices followed by Enter.
 --plain forces numbered prompts. No need to type the storage-mode name.
 
 Encrypted storage uses macOS login Keychain or Linux Secret Service (service

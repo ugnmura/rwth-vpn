@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/ugnmura/rwth-vpn/internal/prompt"
 	"github.com/ugnmura/rwth-vpn/internal/setup"
@@ -76,11 +78,43 @@ func runSetup(args []string) int {
 	for _, name := range []string{"vpn-login-failed", "hpc-login-failed"} {
 		_ = os.Remove(filepath.Join(runtimeDir, "rwth-vpn", name))
 	}
-	if result.HPC {
-		terminal.Close()
-		return runScript([]string{"ssh-setup"})
+	terminal.Close()
+	self, err := os.Executable()
+	if err != nil {
+		return report(err, 1)
 	}
+	err = testSavedSetup(result.HPC, self, func(name string, args ...string) error {
+		checkCtx, stop := context.WithTimeout(ctx, 3*time.Minute)
+		defer stop()
+		cmd := exec.CommandContext(checkCtx, name, args...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		cmd.Env = append(os.Environ(), "RWTH_VPN_SSH_INNER=1", "RWTH_VPN_ASKPASS=1", "SSH_ASKPASS="+self, "SSH_ASKPASS_REQUIRE=force", "DISPLAY=:0")
+		return cmd.Run()
+	})
+	if err != nil {
+		return report(fmt.Errorf("changes were saved, but verification failed: %w; run 'rwth-vpn secrets' to correct credentials", err), 1)
+	}
+	fmt.Fprintln(os.Stdout, "Saved credentials verified.")
 	return 0
+}
+
+// Test a new SSH authentication rather than reusing a master or public key.
+func testSavedSetup(hpc bool, self string, run func(string, ...string) error) error {
+	fmt.Fprintln(os.Stdout, "Testing saved VPN credentials (may take a few seconds)...")
+	if err := run(self, "test-login"); err != nil {
+		return fmt.Errorf("VPN login: %w", err)
+	}
+	if !hpc {
+		return nil
+	}
+	if err := run(self, "ssh-setup"); err != nil {
+		return fmt.Errorf("HPC SSH setup: %w", err)
+	}
+	fmt.Fprintln(os.Stdout, "Testing saved HPC credentials (may take a few seconds)...")
+	if err := run("ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=keyboard-interactive,password", "-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1", "-o", "ConnectTimeout=90", "claix", "true"); err != nil {
+		return fmt.Errorf("HPC login: %w", err)
+	}
+	return nil
 }
 
 func interactiveMenu(version string) int {

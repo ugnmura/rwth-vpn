@@ -68,8 +68,8 @@ func TestVPNOnlyCredentialSetup(t *testing.T) {
 	}
 	cmd.Stdin = strings.NewReader("\n\n\n2\n")
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("VPN-only setup: %v\n%s", err, out)
+	if err == nil || !strings.Contains(string(out), "changes were saved, but verification failed") {
+		t.Fatalf("incomplete VPN-only setup should save then fail verification: %v\n%s", err, out)
 	}
 	if strings.Contains(string(out), "HPC password") {
 		t.Fatalf("HPC prompt in VPN-only setup: %s", out)
@@ -94,6 +94,30 @@ func TestCompiledTOTPCLI(t *testing.T) {
 	}
 	if len(strings.TrimSpace(out)) != 6 {
 		t.Fatalf("invalid code %q", out)
+	}
+}
+
+func TestMenuKeyboardShortcuts(t *testing.T) {
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("PTY test requires script")
+	}
+	for _, input := range []string{"6", "jjjjj\n", "k k\n", "\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\n"} {
+		t.Run(fmt.Sprintf("%q", input), func(t *testing.T) {
+			isolatedHome(t)
+			t.Setenv("TEST_APP", testBinary)
+			t.Setenv("TERM", "xterm")
+			var cmd *exec.Cmd
+			if runtime.GOOS == "linux" {
+				cmd = exec.Command("script", "-q", "-e", "-c", `"$TEST_APP"`, "/dev/null")
+			} else {
+				cmd = exec.Command("script", "-q", "/dev/null", "sh", "-c", `"$TEST_APP"`)
+			}
+			cmd.Stdin = strings.NewReader(input)
+			out, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "Usage:") {
+				t.Fatalf("menu shortcut: %v\n%s", err, out)
+			}
+		})
 	}
 }
 

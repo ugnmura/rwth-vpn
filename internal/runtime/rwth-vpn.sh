@@ -645,7 +645,7 @@ cmd__ssh_master() {
     # Output goes to a file, not $(...): the backgrounded master (-f) would
     # hold a pipe open for its whole lifetime.
     local out tmp=$USER_DIR/master.out.$$
-    echo "rwth-vpn: connecting to $host (may wait for an unused 2FA code)..." >&2
+    echo "rwth-vpn: connecting to $host (may take a few seconds)..." >&2
     RWTH_VPN_ASKPASS=1 SSH_ASKPASS="$SELF" SSH_ASKPASS_REQUIRE=force DISPLAY=${DISPLAY:-:0} \
         ssh -f -N -M -o BatchMode=no -o NumberOfPasswordPrompts=1 \
             -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ConnectTimeout=90 "$host" \
@@ -828,6 +828,10 @@ cmd_secrets() {
 # Log in without starting a tunnel, to check the stored secrets.
 cmd_test_login() {
     local gw out
+    local field
+    for field in user vpn_password totp_secret; do
+        have_secret "$field" || die "missing $field; run 'rwth-vpn secrets' to finish setup"
+    done
     gw=$(gateway_addr)
     [ -n "$gw" ] || die "$SERVER is unreachable on port 443 (IPv4 and IPv6)"
     if out=$(AUTH_LOG=/dev/stderr authenticate "$GROUP_FULL" "$gw" </dev/null 2>&1) &&

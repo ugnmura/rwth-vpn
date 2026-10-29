@@ -1,18 +1,30 @@
 # rwth-vpn
 
-RWTH Aachen VPN and optional CLAIX access. Uses openconnect.
-
-Personal tool. Tested on Linux. RWTH can change things at any time.
+Connect to the RWTH VPN and CLAIX from your terminal.
 
 ## Install
 
-Requires Bash, openconnect and system VPN routing tools. The installer lists missing packages.
+Needs Bash and openconnect.
 
 ```sh
 sh -c "$(curl -fsSL https://github.com/ugnmura/rwth-vpn/releases/latest/download/install.sh)"
 ```
 
 Run `rwth-vpn` for the interactive menu, or `rwth-vpn --help` for commands and flags.
+
+## Usage
+
+Connect:
+
+```sh
+rwth-vpn up
+```
+
+Disconnect:
+
+```sh
+rwth-vpn down
+```
 
 ## Agents
 

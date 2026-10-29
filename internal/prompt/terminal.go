@@ -90,7 +90,7 @@ func (t *Terminal) chooseArrows(label string, items []string, selected int) (int
 		return 0, err
 	}
 	defer term.Restore(int(t.in.Fd()), state)
-	fmt.Fprintf(t.out, "%s (↑/↓, Enter; Esc cancels)\r\n\x1b[?25l", label)
+	fmt.Fprintf(t.out, "%s (1–%d · ↑↓/jk · Enter · Esc)\r\n\x1b[?25l", label, len(items))
 	defer fmt.Fprint(t.out, "\x1b[?25h")
 	draw := func() {
 		for i, item := range items {
@@ -98,7 +98,7 @@ func (t *Terminal) chooseArrows(label string, items []string, selected int) (int
 			if i == selected {
 				marker = ">"
 			}
-			fmt.Fprintf(t.out, "\r %s %s\x1b[K\r\n", marker, item)
+			fmt.Fprintf(t.out, "\r %s %d) %s\x1b[K\r\n", marker, i+1, item)
 		}
 	}
 	draw()
@@ -107,11 +107,22 @@ func (t *Terminal) chooseArrows(label string, items []string, selected int) (int
 		if err != nil {
 			return 0, err
 		}
+		if key >= '1' && key <= '9' && int(key-'1') < len(items) {
+			return int(key - '1'), nil
+		}
 		switch key {
 		case '\r', '\n':
 			return selected, nil
 		case 3, 4, 'q':
 			return 0, context.Canceled
+		case 'j', 'k':
+			if key == 'j' {
+				selected = (selected + 1) % len(items)
+			} else {
+				selected = (selected + len(items) - 1) % len(items)
+			}
+			fmt.Fprintf(t.out, "\x1b[%dA", len(items))
+			draw()
 		case 27:
 			ctx, cancel := context.WithTimeout(t.ctx, 100*time.Millisecond)
 			next, err := await(ctx, t.reader.ReadByte)
