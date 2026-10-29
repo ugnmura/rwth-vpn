@@ -17,6 +17,8 @@ func TestParseCommand(t *testing.T) {
 	}{
 		{"up", []string{"--split", "--user=ab123456"}, []string{"up", "--split", "--user", "ab123456"}},
 		{"up", []string{"--split=false", "--full"}, []string{"up", "--full"}},
+		{"up", []string{"--dtls"}, []string{"up", "--dtls"}},
+		{"up", []string{"--no-dtls"}, []string{"up", "--no-dtls"}},
 		{"secrets", []string{"--no-hpc", "--mode", "encrypted", "--unlock"}, []string{"secrets", "--mode", "encrypted", "--unlock", "--no-hpc"}},
 		{"secrets", []string{"--mode=unencrypted", "--hpc"}, []string{"secrets", "--mode", "unencrypted", "--hpc"}},
 		{"secrets", []string{"--where"}, []string{"secrets", "--where"}},
@@ -24,6 +26,7 @@ func TestParseCommand(t *testing.T) {
 		{"uninstall", []string{"--purge=false"}, []string{"uninstall"}},
 		{"totp", []string{"hpc"}, []string{"totp", "hpc"}},
 		{"status", nil, []string{"status"}},
+		{"configure", []string{"--file", "/tmp/profile", "--json", "--apply"}, []string{"configure", "--file", "/tmp/profile", "--apply", "--json"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"/"+strings.Join(tc.args, " "), func(t *testing.T) {
@@ -43,12 +46,14 @@ func TestRejectInvalidArguments(t *testing.T) {
 	}{
 		{"up", []string{"--user"}},
 		{"up", []string{"--split", "--full"}},
+		{"up", []string{"--dtls", "--no-dtls"}},
 		{"up", []string{"--unknown"}},
 		{"secrets", []string{"--mode", "invalid"}},
 		{"secrets", []string{"--mode="}},
 		{"secrets", []string{"--hpc", "--no-hpc"}},
 		{"uninstall", []string{"--purge=invalid"}},
 		{"status", []string{"unexpected"}},
+		{"configure", []string{"--file", "/tmp/profile", "--stdin"}},
 		{"totp", []string{"vpn"}},
 		{"totp", []string{"hpc", "extra"}},
 	}
@@ -72,7 +77,7 @@ func TestEveryCommandHasGeneratedHelp(t *testing.T) {
 			}
 			fs, _ := commandFlags(cmd, io.Discard)
 			fs.VisitAll(func(f *flag.Flag) {
-				if !strings.Contains(out.String(), "-"+f.Name) {
+				if !strings.Contains(out.String(), "--"+f.Name) {
 					t.Errorf("flag %s absent from generated help", f.Name)
 				}
 			})

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ugnmura/rwth-vpn/internal/credentials"
 	runtimebundle "github.com/ugnmura/rwth-vpn/internal/runtime"
 )
 
@@ -76,38 +75,8 @@ func shellLibrary(t *testing.T, home string) string {
 func runLibrary(t *testing.T, home, body string) (string, error) {
 	t.Helper()
 	lib := shellLibrary(t, home)
-	cmd := exec.Command("bash", "-c", "source \"$1\"; SELF=\"$2\"; is_running() { return 1; }; "+body, "test", lib, testBinary)
+	setup := `source "$1"; SELF="$2"; RUN_DIR="$HOME/test-run"; PID_FILE="$RUN_DIR/openconnect.pid"; STATE_FILE="$RUN_DIR/state"; RECOVERY_FILE="$RUN_DIR/disconnect.env"; LOG_FILE="$HOME/test.log"; is_running() { return 1; }; `
+	cmd := exec.Command("bash", "-c", setup+body, "test", lib, testBinary)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
-}
-
-func mockNative(t *testing.T, home string) string {
-	t.Helper()
-	path := filepath.Join(home, "mock-native")
-	writeTestFile(t, path, `#!/bin/sh
-set -eu
-op=$2
-if [ "$op" = secret-purge ]; then rm -f "$HOME/mock-keyring"; exit 0; fi
-backend=$3
-file=$4
-name=$5
-if [ "$backend" != file ]; then
-    if [ "${MOCK_LOCKED:-0}" = 1 ]; then echo 'keyring locked' >&2; exit 3; fi
-    if [ "$op" = secret-set ] && [ "$name" = "${MOCK_FAIL_NAME:-}" ]; then exit 3; fi
-    if [ "$op" = secret-get ] && [ "$name" = "${MOCK_READ_FAIL_NAME:-}" ]; then exit 3; fi
-    file=$HOME/mock-keyring
-fi
-exec "$REAL_BINARY" __native "$op" file "$file" "$name"
-`, 0700)
-	t.Setenv("REAL_BINARY", testBinary)
-	return path
-}
-
-func fixtureStore(t *testing.T, path string) credentials.Store {
-	t.Helper()
-	store, err := credentials.New("file", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return store
 }

@@ -28,11 +28,11 @@ func TestUninstallPreservesOrPurges(t *testing.T) {
 			writeTestFile(t, filepath.Join(dir, "config"), "invalid shell (\n", 0600)
 			writeTestFile(t, filepath.Join(dir, "storage-mode"), "unencrypted\n", 0600)
 			writeTestFile(t, filepath.Join(dir, "secrets"), "user=dGVzdA==\n", 0600)
-			args := []string{"uninstall"}
+			command := `SELF="$HOME/bin/rwth-vpn"; cmd_uninstall`
 			if purge {
-				args = append(args, "--purge")
+				command += " --purge"
 			}
-			out, err := exec.Command(app, args...).CombinedOutput()
+			out, err := runLibrary(t, home, command)
 			if err != nil {
 				t.Fatalf("%v: %s", err, out)
 			}
@@ -59,13 +59,14 @@ func TestVPNOnlyCredentialSetup(t *testing.T) {
 	writeTestFile(t, filepath.Join(home, "config/rwth-vpn/storage-mode"), "unencrypted\n", 0600)
 	// Call the compiled CLI in a PTY so this exercises the real interactive path.
 	t.Setenv("TEST_APP", testBinary)
+	t.Setenv("TERM", "dumb")
 	var cmd *exec.Cmd
 	if runtime.GOOS == "linux" {
-		cmd = exec.Command("script", "-q", "-e", "-c", `"$TEST_APP" secrets --no-hpc`, "/dev/null")
+		cmd = exec.Command("script", "-q", "-e", "-c", `"$TEST_APP" secrets --mode unencrypted --no-hpc --plain`, "/dev/null")
 	} else {
-		cmd = exec.Command("script", "-q", "/dev/null", "sh", "-c", `"$TEST_APP" secrets --no-hpc`)
+		cmd = exec.Command("script", "-q", "/dev/null", "sh", "-c", `"$TEST_APP" secrets --mode unencrypted --no-hpc --plain`)
 	}
-	cmd.Stdin = strings.NewReader(strings.Repeat("\n", 8))
+	cmd.Stdin = strings.NewReader("\n\n\n2\n")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("VPN-only setup: %v\n%s", err, out)

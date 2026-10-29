@@ -2,12 +2,44 @@ package cli
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"text/tabwriter"
 )
 
+// Keep flag's parser and option metadata, but display conventional long names.
+func printOptions(fs *flag.FlagSet, out io.Writer) {
+	fmt.Fprintln(out, "\nOptions:")
+	table := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "  -h, --help\tShow help")
+	fs.VisitAll(func(option *flag.Flag) {
+		value, description := flag.UnquoteUsage(option)
+		name := "--" + option.Name
+		if value != "" {
+			name += " " + value
+		}
+		fmt.Fprintf(table, "  %s\t%s\n", name, description)
+	})
+	_ = table.Flush()
+}
+
 var topics = map[string]string{
+	"configure": `Read a setup profile from a private JSON file or stdin. The default is a
+redacted preview: no credentials or settings are changed. --apply saves only
+after the human has approved that summary. --json returns names/actions only.
+
+Schema:
+  {"mode":"encrypted|unencrypted","hpc":true|false,"credentials":{...}}
+Credential names: user, vpn_password, totp_secret, hpc_user, hpc_password,
+hpc_totp_secret. Omitted values are kept; null clears a value. TOTP fields need
+a base32 secret or otpauth:// URI, not the current six-digit code.
+
+Never put passwords or TOTP secrets in command arguments, environment variables,
+chat, or recorded tool-call bodies. A secure UI can supply a private 0600 file
+or a protected stdin stream. See docs/AGENTS.md in the source repository.
+After applying an HPC profile, run rwth-vpn ssh-setup to configure SSH aliases.
+`,
 	"up": `Full tunnel is the default: all traffic goes through RWTH, including publisher
 websites. Tailscale keeps its direct route. --split routes only RWTH networks;
 publishers will still see your normal IP address.
@@ -17,10 +49,18 @@ Requires Bash, openconnect, the system vpnc-script, and iproute2 on Linux.
 uses sudo/doas. Store credentials with rwth-vpn secrets first.
 
 Stop with rwth-vpn down. Set RWTH_MODE=split in the config to default to split.
+
+TLS-only transport is the default. Some IPv6/NAT paths establish DTLS but pass
+no tunnel traffic. --dtls opts into UDP transport; --no-dtls forces TLS-only.
+If the VPN process exits unexpectedly, down restores its saved routing/DNS.
 `,
 	"secrets": `Setup offers a storage mode and VPN credentials. HPC setup is optional.
 --no-hpc skips HPC prompts and SSH setup; --hpc enables them later.
-Enter keeps a value; '-' deletes it. --where explains where to get credentials.
+Enter keeps a value; '-' stages its removal. --where explains where to get credentials.
+Edits stay in memory until the final Save changes confirmation. Cancel, Ctrl-C,
+or closing input keeps credentials, storage mode and HPC preferences unchanged.
+Use arrow keys to choose storage; limited terminals use numbered choices.
+--plain forces numbered prompts. No need to type the storage-mode name.
 
 Encrypted storage uses macOS login Keychain or Linux Secret Service (service
 rwth-vpn). Linux needs a running Secret Service provider, such as GNOME Keyring,
@@ -65,6 +105,7 @@ Optional shell assignments:
   RWTH_USER=ab123456       VPN username (otherwise read from stored credentials)
   RWTH_HPC_USER=ab123456   HPC username override
   RWTH_MODE=full          Default tunnel mode: full or split
+  RWTH_DTLS=0             TLS-only by default; 1 opts into UDP/DTLS transport
   RWTH_SOCKS_PORT=11080   Rootless SSH proxy port
 
 Only put trusted shell code in this file. Use rwth-vpn secrets for passwords and

@@ -802,181 +802,27 @@ storage_probe() {
     die "encrypted storage unavailable; unlock the keyring and retry (no file fallback)"
 }
 
-select_storage() {
-    local mode=$1 old name value tmp
-    case "$mode" in encrypted|unencrypted) ;; *) die "mode must be encrypted or unencrypted";; esac
-    old=$(secret_backend)
-    # Ensure the source keyring is available before treating missing keys as unset.
-    storage_probe
-    SECRET_MODE_OVERRIDE=$mode storage_probe
-    # Verify every copied value before committing the new mode or deleting originals.
-    if [ "$old" != "$(SECRET_MODE_OVERRIDE=$mode secret_backend)" ]; then
-        for name in $SECRET_NAMES; do
-            if value=$(secret_get "$name"); then :
-            else
-                local status=$?
-                [ "$status" = 1 ] || storage_transfer_failed "cannot read original credentials"
-            fi
-            SECRET_MODE_OVERRIDE=$mode secret_set "$name" "$value" || storage_transfer_failed "credential transfer failed"
-            local copied
-            if copied=$(SECRET_MODE_OVERRIDE=$mode secret_get "$name"); then :
-            else
-                local status=$?
-                [ "$status" = 1 ] && [ -z "$value" ] || storage_transfer_failed "credential verification failed"
-            fi
-            [ "$copied" = "$value" ] || storage_transfer_failed "credential verification failed"
-        done
-    fi
-    (
-        umask 077
-        mkdir -p "$(dirname "$STORAGE_FILE")"
-        tmp=$(mktemp "$STORAGE_FILE.XXXXXXXX")
-        printf '%s\n' "$mode" >"$tmp"
-        mv "$tmp" "$STORAGE_FILE"
-    )
-    if [ "$old" != "$(secret_backend)" ]; then
-        case "$old" in
-            file) rm -f "$SECRETS_FILE";;
-            secret-service)
-                "$SELF" __native secret-purge secret-service || die "mode changed, but old keyring credentials could not be removed";;
-            keychain)
-                "$SELF" __native secret-purge keychain || die "mode changed, but old Keychain credentials could not be removed";;
-        esac
-    fi
-    echo "Credential storage: $mode ($(secret_backend))."
-}
-
-storage_transfer_failed() {
-    # select_storage's local mode is visible here. The destination is inactive;
-    # remove partial copies while keeping the original backend and mode intact.
-    local target
-    target=$(SECRET_MODE_OVERRIDE=$mode secret_backend)
-    if [ "$target" = file ]; then rm -f "$SECRETS_FILE"
-    else
-        "$SELF" __native secret-purge "$target" ||
-            echo "rwth-vpn: could not remove partial copies from $target; unlock it and retry the mode change" >&2
-    fi
-    die "$1; original mode and credentials kept"
-}
-
-prompt_secret() {
-    local name=$1 label=$2 hidden=$3 note=${4:-unset} cur v
-    cur=$(secret_get "$name" || true)
-    while :; do
-        if [ "$hidden" = 1 ]; then
-            printf '  %s [%s]: ' "$label" "$([ -n "$cur" ] && echo set || echo "$note")"
-            stty -echo; IFS= read -r v || true; stty echo; echo
-        else
-            printf '  %s [%s]: ' "$label" "${cur:-$note}"
-            IFS= read -r v || true
-        fi
-        case "$v" in
-            "") return 0;;
-            -) secret_set "$name" ""; echo "    deleted"; return 0;;
-        esac
-        case "$name" in
-            *totp_secret)
-                if ! printf '%s' "$v" | "$SELF" __native totp >/dev/null 2>&1; then
-                    echo "    That isn't a base32 secret or otpauth:// link; try again ('-' to delete)."
-                    continue
-                fi
-                secret_set "$name" "$v"
-                echo "    Current code: $(printf '%s' "$v" | "$SELF" __native totp)  <- should match your phone"
-                ;;
-            *) secret_set "$name" "$v";;
-        esac
-        return 0
-    done
-}
-
+# Interactive editing and confirmed commits are handled by Go. These two
+# read-only/explicit-unlock entry points retain the existing platform helpers.
 cmd_secrets() {
-    local mode="" want_hpc="" unlock=0 profile=""
+    local mode="" unlock=0
     while [ $# -gt 0 ]; do
-    case "$1" in
-        --no-hpc) want_hpc=0;;
-        --hpc) want_hpc=1;;
-        --unlock) unlock=1;;
-        --mode)
-            [ $# -ge 2 ] || die "--mode needs encrypted or unencrypted"
-            mode=$2
-            case "$mode" in encrypted|unencrypted) ;; *) die "mode must be encrypted or unencrypted";; esac
-            shift;;
-        --where|--help|-h)
-            secrets_guide_vpn; echo; secrets_guide_hpc
-            echo; echo "Storage: rwth-vpn secrets --mode encrypted|unencrypted"
-            echo "Unlock: rwth-vpn secrets --unlock"
-            echo; echo "Run 'rwth-vpn secrets' in a terminal to enter them."
-            return 0;;
-        *) die "usage: rwth-vpn secrets [--mode encrypted|unencrypted] [--unlock] [--no-hpc|--hpc]";;
-    esac
-    shift
+        case "$1" in
+            --mode) mode=${2:?--mode needs a value}; shift;;
+            --unlock) unlock=1;;
+            --where|--help|-h)
+                secrets_guide_vpn; echo; secrets_guide_hpc
+                return 0;;
+            *) die "use 'rwth-vpn secrets' for interactive credential setup";;
+        esac
+        shift
     done
     if [ "$unlock" = 1 ]; then
         if [ -n "$mode" ]; then SECRET_MODE_OVERRIDE=$mode unlock_secrets
         else unlock_secrets; fi
         return
     fi
-    [ -t 0 ] || { secrets_guide_vpn; echo; secrets_guide_hpc; die "run 'rwth-vpn secrets' in a terminal to enter them"; }
-
-    if [ -z "$mode" ] && [ ! -f "$STORAGE_FILE" ]; then
-        echo "Choose storage: encrypted (Keychain / Secret Service) or unencrypted (0600 file)."
-        printf 'Storage mode [encrypted]: '
-        IFS= read -r mode
-        mode=${mode:-encrypted}
-    fi
-    if [ -n "$mode" ]; then select_storage "$mode"; else storage_probe; fi
-    if [ -z "$want_hpc" ]; then
-        if [ -f "$PROFILE_FILE" ]; then IFS= read -r profile <"$PROFILE_FILE" || true; fi
-        case "$profile" in
-            vpn-only) want_hpc=0;;
-            hpc) want_hpc=1;;
-            *)
-                printf 'Set up HPC credentials and SSH access too? [y/N] '
-                local answer
-                IFS= read -r answer || answer=n
-                case "$answer" in [Yy]*) want_hpc=1;; *) want_hpc=0;; esac;;
-        esac
-    fi
-    if [ "$want_hpc" = 1 ]; then echo hpc >"$PROFILE_FILE"
-    else echo vpn-only >"$PROFILE_FILE"; fi
-    case "$(secret_backend)" in
-        keychain) echo "Secrets are stored in your macOS login Keychain (service rwth-vpn).";;
-        secret-service) echo "Secrets are stored in Linux Secret Service (service rwth-vpn).";;
-        file) echo "Secrets are stored in $SECRETS_FILE (mode 0600, base64 encoded, NOT encrypted).";;
-    esac
-    load_config
-    tls_workaround
-    echo "Enter keeps the current value, '-' deletes it. Typing is hidden for passwords and secrets."
-    echo
-    secrets_guide_vpn
-    prompt_secret user "RWTH username, e.g. ab123456" 0
-    prompt_secret vpn_password "VPN password" 1
-    prompt_secret totp_secret "VPN TOTP secret" 1
-    echo
-    if [ "$want_hpc" = 1 ]; then
-        secrets_guide_hpc
-        prompt_secret hpc_user "HPC username" 0 "same as RWTH"
-        prompt_secret hpc_password "HPC password" 1
-        prompt_secret hpc_totp_secret "HPC TOTP secret" 1
-    fi
-
-    echo
-    if have_secret user && have_secret vpn_password && have_secret totp_secret; then
-        printf 'Test the VPN login now? [Y/n] '
-        local ans; read -r ans || ans=n
-        case "$ans" in
-            [Nn]*) ;;
-            *) cmd_test_login;;
-        esac
-    else
-        echo "VPN secrets incomplete: logins will prompt for what's missing."
-    fi
-    rm -f "$VPN_FAIL_MARK" "$HPC_FAIL_MARK"
-    # Regenerate: the HPC username goes into the ssh config's User line.
-    if [ "$want_hpc" = 1 ]; then
-        cmd_ssh_setup >/dev/null
-        if have_secret hpc_password; then echo "Next: ssh claix hostname"; fi
-    fi
+    die "interactive credential setup must run through the Go CLI"
 }
 
 # Log in without starting a tunnel, to check the stored secrets.

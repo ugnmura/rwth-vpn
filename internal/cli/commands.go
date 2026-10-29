@@ -15,6 +15,7 @@ type command struct {
 }
 
 var commands = []command{
+	{"configure", "Preview or apply an agent-provided setup profile", ""},
 	{"secrets", "Store credentials and choose encrypted or unencrypted storage", ""},
 	{"up", "Connect the whole machine through RWTH", ""},
 	{"down", "Stop VPN sessions", ""},
@@ -37,16 +38,20 @@ func findCommand(name string) (command, bool) {
 
 type options struct {
 	split, full                      bool
+	dtls, noDTLS                     bool
 	user                             string
 	mode                             string
 	hpc, noHPC, unlock, where, purge bool
+	plain                            bool
+	inputFile                        string
+	stdin, apply, json               bool
 }
 
 func rootFlags(out io.Writer) (*flag.FlagSet, *bool) {
 	fs := flag.NewFlagSet("rwth-vpn", flag.ContinueOnError)
 	fs.SetOutput(out)
 	version := fs.Bool("version", false, "Print the build version")
-	fs.Usage = func() { printOverview(out); fmt.Fprintln(out, "\nOptions:"); fs.PrintDefaults() }
+	fs.Usage = func() { printOverview(out); printOptions(fs, out) }
 	return fs, version
 }
 
@@ -55,11 +60,19 @@ func commandFlags(cmd command, out io.Writer) (*flag.FlagSet, *options) {
 	fs.SetOutput(out)
 	opts := new(options)
 	switch cmd.name {
+	case "configure":
+		fs.StringVar(&opts.inputFile, "file", "", "Private setup JSON `path` (not printed)")
+		fs.BoolVar(&opts.stdin, "stdin", false, "Read setup JSON from standard input")
+		fs.BoolVar(&opts.apply, "apply", false, "Save the reviewed profile after explicit human approval")
+		fs.BoolVar(&opts.json, "json", false, "Print a redacted machine-readable summary")
 	case "up":
 		fs.BoolVar(&opts.split, "split", false, "Route only RWTH networks (requires vpn-slice)")
 		fs.BoolVar(&opts.full, "full", false, "Route all traffic through RWTH")
+		fs.BoolVar(&opts.dtls, "dtls", false, "Enable UDP/DTLS transport (opt-in; some networks blackhole it)")
+		fs.BoolVar(&opts.noDTLS, "no-dtls", false, "Use TLS-only transport (default)")
 		fs.StringVar(&opts.user, "user", "", "RWTH `username`, e.g. ab123456")
 	case "secrets":
+		fs.BoolVar(&opts.plain, "plain", false, "Use numbered prompts instead of the interactive selector")
 		fs.StringVar(&opts.mode, "mode", "", "Credential storage `mode`: encrypted or unencrypted")
 		fs.BoolVar(&opts.hpc, "hpc", false, "Also set up HPC credentials and SSH access")
 		fs.BoolVar(&opts.noHPC, "no-hpc", false, "Skip HPC credentials and SSH setup")
@@ -79,10 +92,7 @@ func commandFlags(cmd command, out io.Writer) (*flag.FlagSet, *options) {
 			fmt.Fprint(out, " ", cmd.positional)
 		}
 		fmt.Fprint(out, "\n\n", cmd.summary, ".\n")
-		if hasOptions {
-			fmt.Fprintln(out, "\nOptions:")
-			fs.PrintDefaults()
-		}
+		printOptions(fs, out)
 		topic := cmd.name
 		if topic == "ssh-setup" {
 			topic = "ssh"
@@ -119,6 +129,15 @@ func parseCommand(cmd command, args []string, out io.Writer) ([]string, error) {
 	result := []string{cmd.name}
 	switch cmd.name {
 	case "up":
+		if opts.dtls && opts.noDTLS {
+			return nil, errors.New("choose either --dtls or --no-dtls")
+		}
+		if opts.dtls {
+			result = append(result, "--dtls")
+		}
+		if opts.noDTLS {
+			result = append(result, "--no-dtls")
+		}
 		if opts.split && opts.full {
 			return nil, errors.New("choose either --split or --full")
 		}
@@ -131,7 +150,27 @@ func parseCommand(cmd command, args []string, out io.Writer) ([]string, error) {
 		if provided["user"] {
 			result = append(result, "--user", opts.user)
 		}
+	case "configure":
+		if opts.inputFile != "" && opts.stdin {
+			return nil, errors.New("choose either --file or --stdin")
+		}
+		if opts.inputFile != "" {
+			result = append(result, "--file", opts.inputFile)
+		}
+		if opts.stdin {
+			result = append(result, "--stdin")
+		}
+		if opts.apply {
+			result = append(result, "--apply")
+		}
+		if opts.json {
+			result = append(result, "--json")
+		}
+
 	case "secrets":
+		if opts.plain {
+			result = append(result, "--plain")
+		}
 		if provided["mode"] && opts.mode != "encrypted" && opts.mode != "unencrypted" {
 			return nil, errors.New("mode must be encrypted or unencrypted")
 		}

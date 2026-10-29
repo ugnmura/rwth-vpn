@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/ugnmura/rwth-vpn/internal/credentials"
+	"github.com/ugnmura/rwth-vpn/internal/prompt"
 	runtimebundle "github.com/ugnmura/rwth-vpn/internal/runtime"
 )
 
@@ -47,6 +48,9 @@ func Run(args []string, version string) int {
 	}
 	args = root.Args()
 	if len(args) == 0 {
+		if prompt.IsTerminal(os.Stdin) && prompt.IsTerminal(os.Stdout) {
+			return interactiveMenu(version)
+		}
 		return help(nil)
 	}
 	if args[0] == "help" {
@@ -62,6 +66,12 @@ func Run(args []string, version string) int {
 	}
 	if err != nil {
 		return report(err, 2)
+	}
+	if cmd.name == "configure" {
+		return configure(normalized[1:])
+	}
+	if cmd.name == "secrets" {
+		return runSetup(normalized[1:])
 	}
 	return runScript(normalized)
 }
