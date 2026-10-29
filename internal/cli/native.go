@@ -9,7 +9,9 @@ import (
 
 	"github.com/ugnmura/rwth-vpn/internal/credentials"
 	"github.com/ugnmura/rwth-vpn/internal/network"
+	"github.com/ugnmura/rwth-vpn/internal/sshstate"
 	"github.com/ugnmura/rwth-vpn/internal/totp"
+	"github.com/ugnmura/rwth-vpn/internal/vpnauth"
 )
 
 func native(args []string) error {
@@ -17,6 +19,47 @@ func native(args []string) error {
 		return errors.New("missing native operation")
 	}
 	switch args[0] {
+	case "ssh-session":
+		if len(args) != 6 {
+			return errors.New("ssh-session requires action, marker, and transport metadata paths")
+		}
+		session := sshstate.Current(args[3], args[4], args[5])
+		switch args[1] {
+		case "check":
+			ok, err := sshstate.Matches(args[2], session)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("SSH master belongs to an earlier VPN session")
+			}
+			return nil
+		case "record":
+			return sshstate.Record(args[2], session)
+		default:
+			return errors.New("unknown SSH session action")
+		}
+
+	case "authenticate":
+		if len(args) < 4 {
+			return errors.New("authenticate requires backend, file, and openconnect arguments")
+		}
+		store, err := credentials.New(args[1], args[2])
+		if err != nil {
+			return err
+		}
+		path := os.Getenv("AUTH_LOG")
+		if path == "" {
+			path = os.DevNull
+		}
+		log, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+		if err != nil {
+			return err
+		}
+		defer log.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		return vpnauth.Authenticate(ctx, store, args[3:], os.Stdout, log)
 	case "help":
 		return printHelp(os.Stdout, args[1:])
 	case "totp":

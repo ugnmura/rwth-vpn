@@ -16,6 +16,7 @@ SPLIT_ROUTES="134.61.0.0/16 134.130.0.0/16 137.226.0.0/16"
 RUN_DIR=/var/run/rwth-vpn
 PID_FILE=$RUN_DIR/openconnect.pid
 STATE_FILE=$RUN_DIR/state
+RECOVERY_FILE=$RUN_DIR/disconnect.env
 LOG_FILE=/var/log/rwth-vpn.log
 
 resolve_self() {
@@ -107,6 +108,8 @@ load_config() {
         RWTH_USER=$(secret_get user || true)
     fi
     RWTH_MODE=${RWTH_MODE:-full}
+    RWTH_DTLS=${RWTH_DTLS:-0}
+    case "$RWTH_DTLS" in 0|1) ;; *) die "RWTH_DTLS must be 0 or 1";; esac
     RWTH_SOCKS_PORT=${RWTH_SOCKS_PORT:-11080}
     # Overridable for testing against another AnyConnect server (e.g. ocserv).
     SERVER=${RWTH_SERVER:-$SERVER}
@@ -128,10 +131,8 @@ authenticate() {
     local args=("${UA_ARGS[@]}" --resolve="$SERVER:$gw" --authgroup="$group")
     [ -n "$user" ] && args+=(--user="$user")
     if [ -n "$user" ] && have_secret vpn_password && have_secret totp_secret; then
-        local code
-        code=$(secret_get totp_secret | "$SELF" __native totp --fresh) || die "cannot compute TOTP code"
-        { secret_get vpn_password; echo; echo "$code"; } |
-            openconnect --authenticate "${args[@]}" "$SERVER" 2>>"${AUTH_LOG:-/dev/null}"
+        "$SELF" __native authenticate "$(secret_backend)" "$SECRETS_FILE" \
+            --authenticate "${args[@]}" "$SERVER"
     elif [ ! -t 0 ]; then
         # No terminal to prompt on (agents, ssh ProxyCommand): fail clearly.
         echo "rwth-vpn: VPN secrets incomplete (need username, VPN password, TOTP secret): run 'rwth-vpn secrets'" >&2
@@ -176,7 +177,16 @@ tls_workaround() {
 
 is_running() {
     # ps, not kill -0: the tunnel runs as root, so kill -0 from the user fails (EPERM).
-    [ -r "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    process_running "$pid"
+}
+
+process_running() {
+    local state
+    state=$(ps -p "$1" -o stat= 2>/dev/null) || return 1
+    # Containers without a reaping init can retain an exited process as a zombie.
+    case "$state" in ""|*Z*|*X*) return 1;; *) return 0;; esac
 }
 
 find_vpnc_script() {
@@ -230,11 +240,13 @@ cmd_check() {
 }
 
 cmd_up() {
-    local mode=$RWTH_MODE user=$RWTH_USER
+    local mode=$RWTH_MODE user=$RWTH_USER dtls=$RWTH_DTLS
     while [ $# -gt 0 ]; do
         case "$1" in
             --split) mode="split";;
             --full) mode="full";;
+            --dtls) dtls=1;;
+            --no-dtls) dtls=0;;
             --user) user=${2:?--user needs a value}; shift;;
             --user=*) user=${1#--user=};;
             *) die "unknown option: $1";;
@@ -258,6 +270,10 @@ cmd_up() {
         if [ "$el" = sudo ]; then sudo -v; else doas true; fi || die "root is required to create the tunnel"
     fi
 
+    # A previous crash can leave DNS unusable, so recover before resolving the gateway.
+    if [ -e "$RECOVERY_FILE" ]; then
+        if is_root; then recover_tunnel; else "$el" "$SELF" down; fi
+    fi
     local gw
     gw=$(gateway_addr)
     [ -n "$gw" ] || die "$SERVER is unreachable on port 443 (IPv4 and IPv6)"
@@ -276,16 +292,16 @@ cmd_up() {
     [ -n "$url" ] || url="https://$SERVER/"
 
     if is_root; then
-        printf '%s\n' "$cookie" | "$SELF" _connect "$mode" "$url" "$fp" "$SERVER:$gw"
+        printf '%s\n' "$cookie" | "$SELF" _connect "$mode" "$url" "$fp" "$SERVER:$gw" "$dtls"
     else
         printf '%s\n' "$cookie" | "$el" env SUDO_USER_HOME="$HOME" \
-            "$SELF" _connect "$mode" "$url" "$fp" "$SERVER:$gw"
+            "$SELF" _connect "$mode" "$url" "$fp" "$SERVER:$gw" "$dtls"
     fi
 }
 
 # Runs as root; reads the session cookie from stdin.
 cmd__connect() {
-    local mode=$1 url=$2 fp=$3 resolve=$4
+    local mode=$1 url=$2 fp=$3 resolve=$4 dtls=${5:-$RWTH_DTLS}
     is_root || die "_connect must run as root"
     mkdir -p "$RUN_DIR"
     chmod 755 "$RUN_DIR"
@@ -303,14 +319,21 @@ cmd__connect() {
     local args=("${UA_ARGS[@]}" --cookie-on-stdin --servercert="$fp" --resolve="$resolve"
                 --script="'$SELF' _hook" --background --pid-file="$PID_FILE" --timestamp)
     [ "$(uname -s)" = Linux ] && args+=(--interface=tun-rwth)
+    [ "$dtls" = 1 ] || args+=(--no-dtls)
 
     printf '\n=== %s up (%s)\n' "$(date)" "$mode" >>"$LOG_FILE"
     openconnect "${args[@]}" "$url" >>"$LOG_FILE" 2>&1 \
-        || { tail -n 20 "$LOG_FILE" >&2; die "tunnel failed (log: $LOG_FILE)"; }
+        || { tail -n 20 "$LOG_FILE" >&2; recover_tunnel; die "tunnel failed (log: $LOG_FILE)"; }
+    # PID and connection metadata are public; hook recovery inputs remain 0600.
+    chmod 644 "$PID_FILE"
 
     # openconnect backgrounds before it runs the hook; wait for the hook's state.
     local n=0
     while [ ! -r "$STATE_FILE" ] && [ $n -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
+    if [ ! -r "$STATE_FILE" ]; then
+        cmd_down
+        die "routing/DNS hook did not complete; tunnel stopped"
+    fi
     cmd_status
 }
 
@@ -339,7 +362,9 @@ PREF_V6_BLOCK=5281
 TS_MARK=0x80000/0xff0000
 
 write_state() {
-    cat >"$RWTH_VPN_STATE" <<EOF
+    local tmp
+    tmp=$(mktemp "$RUN_DIR/.state.XXXXXXXX") || return 1
+    cat >"$tmp" <<EOF
 MODE='$RWTH_VPN_MODE'
 TUNDEV='$TUNDEV'
 IP4='$INTERNAL_IP4_ADDRESS'
@@ -347,6 +372,33 @@ IP6='${INTERNAL_IP6_ADDRESS:-}'
 SINCE='$(date '+%Y-%m-%d %H:%M')'
 V6_BLOCKED='${V6_BLOCKED:-}'
 EOF
+    chmod 644 "$tmp" && mv "$tmp" "$RWTH_VPN_STATE"
+}
+
+# Save only the routing/DNS hook inputs, never authentication cookies or passwords.
+# declare -p quotes server-supplied values safely for Bash. The file is root-only.
+save_recovery() {
+    local name tmp
+    tmp=$(umask 077; mktemp "$RUN_DIR/.disconnect.XXXXXXXX") || return 1
+    for name in $(compgen -e); do
+        case "$name" in
+            VPNPID|VPNGATEWAY|TUNDEV|INTERNAL_*|CISCO_*|RWTH_VPN_*)
+                declare -p "$name";;
+        esac
+    done >"$tmp"
+    mv "$tmp" "$RECOVERY_FILE"
+}
+
+recover_tunnel() {
+    [ -f "$RECOVERY_FILE" ] || return 0
+    is_root || die "root is required to restore tunnel routing and DNS"
+    (
+        # shellcheck disable=SC1090
+        . "$RECOVERY_FILE"
+        export reason=disconnect
+        "$SELF" _hook >>"$LOG_FILE" 2>&1
+    ) || die "could not restore tunnel routing/DNS; see $LOG_FILE; recovery data kept in $RUN_DIR"
+    rm -f "$PID_FILE" "$STATE_FILE" "$RECOVERY_FILE"
 }
 
 has_tailscale_rules() {
@@ -380,14 +432,22 @@ linux_full_cleanup() {
 cmd__hook() {
     # vpnc-script conventions: plain sh semantics, unset variables allowed.
     set +eu +o pipefail
+    if [ "$reason" = connect ]; then
+        save_recovery || exit 1
+    fi
     case "$RWTH_VPN_MODE" in
     split)
         case "$reason" in
             connect) write_state;;
-            disconnect) rm -f "$RWTH_VPN_STATE";;
+            disconnect) ;;
         esac
         # shellcheck disable=SC2086
-        exec "$RWTH_VPN_SLICE" -S -I $RWTH_VPN_SPLIT_ROUTES
+        "$RWTH_VPN_SLICE" -S -I $RWTH_VPN_SPLIT_ROUTES
+        result=$?
+        if [ "$reason" = disconnect ] && [ "$result" = 0 ]; then
+            rm -f "$RWTH_VPN_STATE" "$RECOVERY_FILE"
+        fi
+        exit "$result"
         ;;
     esac
 
@@ -395,7 +455,10 @@ cmd__hook() {
     if [ "$(uname -s)" != Linux ]; then
         case "$reason" in
             connect) "$RWTH_VPN_VPNC_SCRIPT" && write_state; exit;;
-            disconnect) rm -f "$RWTH_VPN_STATE";;
+            disconnect)
+                "$RWTH_VPN_VPNC_SCRIPT" || exit $?
+                rm -f "$RWTH_VPN_STATE" "$RECOVERY_FILE"
+                exit 0;;
         esac
         exec "$RWTH_VPN_VPNC_SCRIPT"
     fi
@@ -419,8 +482,10 @@ cmd__hook() {
         ;;
     disconnect)
         "$RWTH_VPN_VPNC_SCRIPT"
+        result=$?
         linux_full_cleanup
-        rm -f "$RWTH_VPN_STATE"
+        [ "$result" = 0 ] || exit "$result"
+        rm -f "$RWTH_VPN_STATE" "$RECOVERY_FILE"
         ;;
     *)
         exec "$RWTH_VPN_VPNC_SCRIPT"
@@ -442,7 +507,9 @@ backoff_msg() {
 }
 
 proxy_running() {
-    [ -r "$PROXY_PID" ] && kill -0 "$(cat "$PROXY_PID")" 2>/dev/null
+    local pid
+    pid=$(cat "$PROXY_PID" 2>/dev/null) || return 1
+    process_running "$pid"
 }
 
 # ssh masters ride on the VPN session; once it's gone they only hang around.
@@ -460,8 +527,8 @@ proxy_stop() {
     local pid n=0
     pid=$(cat "$PROXY_PID")
     kill -INT "$pid"
-    while kill -0 "$pid" 2>/dev/null && [ $n -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
-    kill -0 "$pid" 2>/dev/null && kill -TERM "$pid"
+    while proxy_running && [ $n -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
+    proxy_running && kill -TERM "$pid"
     rm -f "$PROXY_PID"
 }
 
@@ -506,7 +573,9 @@ proxy_ensure() {
     fi
     rm -f "$VPN_FAIL_MARK"
 
-    printf '%s\n' "$cookie" | openconnect "${UA_ARGS[@]}" --cookie-on-stdin \
+    local transport_args=("${UA_ARGS[@]}")
+    [ "$RWTH_DTLS" = 1 ] || transport_args+=(--no-dtls)
+    printf '%s\n' "$cookie" | openconnect "${transport_args[@]}" --cookie-on-stdin \
         --servercert="$fp" --resolve="$SERVER:$gw" \
         --script-tun --script="$ocproxy -D $RWTH_SOCKS_PORT -k 60" \
         --background --pid-file="$PROXY_PID" --timestamp \
@@ -538,9 +607,10 @@ cmd__ssh_master() {
     # Our own ssh calls below re-read the config; don't recurse.
     [ -n "${RWTH_VPN_SSH_INNER:-}" ] && return 0
     export RWTH_VPN_SSH_INNER=1
+    local marker=$USER_DIR/master.$(printf '%s' "$host" | tr -c 'A-Za-z0-9.-' _).session
     if ssh -O check "$host" >/dev/null 2>&1; then
-        { is_running || proxy_running; } && return 0
-        # The VPN session under this master is gone (down, timeout): replace it.
+        "$SELF" __native ssh-session check "$marker" "$PID_FILE" "$STATE_FILE" "$PROXY_PID" >/dev/null 2>&1 && return 0
+        # The transport under this master ended or was replaced: reconnect.
         ssh -O exit "$host" >/dev/null 2>&1 || true
     fi
     have_secret hpc_password || return 0
@@ -575,12 +645,15 @@ cmd__ssh_master() {
     # Output goes to a file, not $(...): the backgrounded master (-f) would
     # hold a pipe open for its whole lifetime.
     local out tmp=$USER_DIR/master.out.$$
+    echo "rwth-vpn: connecting to $host (may wait for an unused 2FA code)..." >&2
     RWTH_VPN_ASKPASS=1 SSH_ASKPASS="$SELF" SSH_ASKPASS_REQUIRE=force DISPLAY=${DISPLAY:-:0} \
-        ssh -f -N -M -o BatchMode=no -o NumberOfPasswordPrompts=1 "$host" \
+        ssh -f -N -M -o BatchMode=no -o NumberOfPasswordPrompts=1 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ConnectTimeout=90 "$host" \
         </dev/null >"$tmp" 2>&1 || true
     out=$(cat "$tmp"); rm -f "$tmp"
     printf '=== %s master %s\n%s\n' "$(date)" "$host" "$out" >>"$USER_DIR/ssh.log"
     if ssh -O check "$host" >/dev/null 2>&1; then
+        "$SELF" __native ssh-session record "$marker" "$PID_FILE" "$STATE_FILE" "$PROXY_PID" >/dev/null 2>&1 || true
         rm -f "$HPC_FAIL_MARK"
     elif printf '%s' "$out" | grep -q 'Permission denied'; then
         # Only a rejected login pauses retries; network trouble doesn't.
@@ -930,17 +1003,35 @@ cmd_totp() {
 
 cmd_down() {
     proxy_running && { proxy_stop; echo "ssh proxy session stopped"; }
-    is_running || { echo "not connected"; return 0; }
+    # A restrictive root umask on older installations can hide the PID file.
+    # Its existence still means root must inspect and clean up the session.
+    if ! is_root && { [ -e "$PID_FILE" ] || [ -e "$RECOVERY_FILE" ]; }; then
+        exec "$(elevate_cmd)" "$SELF" down
+    fi
+    if ! is_running; then
+        if [ -e "$RECOVERY_FILE" ]; then
+            is_root || exec "$(elevate_cmd)" "$SELF" down
+            recover_tunnel
+            echo "restored routing and DNS from the exited VPN session"
+        elif [ -e "$STATE_FILE" ]; then
+            die "stale tunnel state without recovery data; reconnect your normal network to restore routing/DNS"
+        else
+            echo "not connected"
+        fi
+        return 0
+    fi
     is_root || exec "$(elevate_cmd)" "$SELF" down
     local pid n=0
     pid=$(cat "$PID_FILE")
     # SIGINT makes openconnect log off the session and run the disconnect hook.
     kill -INT "$pid"
-    while kill -0 "$pid" 2>/dev/null && [ $n -lt 30 ]; do
+    while is_running && [ $n -lt 30 ]; do
         sleep 0.5
         n=$((n + 1))
     done
-    kill -0 "$pid" 2>/dev/null && { kill -TERM "$pid"; sleep 1; }
+    is_running && { kill -TERM "$pid"; sleep 1; }
+    is_running && die "VPN process did not stop; recovery data kept in $RUN_DIR"
+    recover_tunnel
     rm -f "$PID_FILE"
     echo "disconnected"
 }
@@ -952,8 +1043,8 @@ cmd_uninstall() {
         1:--purge) purge=1;;
         *) die "usage: rwth-vpn uninstall [--purge]";;
     esac
-    if is_running; then
-        die "run 'rwth-vpn down' before uninstalling the active whole-machine tunnel"
+    if is_running || [ -e "$RECOVERY_FILE" ]; then
+        die "run 'rwth-vpn down' before uninstalling the whole-machine tunnel"
     fi
     # Close persistent SSH masters before removing their proxy configuration.
     for socket in "$HOME/.ssh/rwth-vpn-cm/"*; do
@@ -998,6 +1089,10 @@ cmd_status() {
         echo "ssh proxy session: up (SOCKS5 127.0.0.1:$RWTH_SOCKS_PORT, pid $(cat "$PROXY_PID"))"
     fi
     if ! is_running; then
+        if [ -e "$RECOVERY_FILE" ]; then
+            echo "rwth-vpn: VPN process exited; routing/DNS cleanup pending (run 'rwth-vpn down')"
+            return 1
+        fi
         echo "rwth-vpn: not connected"
         return 1
     fi

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run the rwth-vpn lab test cases a-k against a lab built by setup.sh.
+# Run the rwth-vpn lab test cases a-l against a lab built by setup.sh.
 #   ./tests.sh [a b c ...]     (default: all)
 # Prints evidence and a PASS/FAIL line per case; summary at the end.
 set -u
@@ -57,7 +57,8 @@ t_c() {
     out=$(u 's=$(date +%s)
         for i in 1 2 3 4 5; do ( o=$(ssh -o BatchMode=yes claix "echo call'"\$i"'" </dev/null 2>&1); echo "rc=$? $o $(( $(date +%s)-s ))s" ) & done; wait')
     echo "$out"; counts
-    [ "$(grep -c "rc=0 call" <<<"$out")" = 5 ] &&
+    [ "$(grep -c '^rc=0' <<<"$out")" = 5 ] &&
+        [ "$(grep -c 'call[1-5] [0-9]*s$' <<<"$out")" = 5 ] &&
         counts | grep -q "openconnect=1 ocproxy=1 masters=1 locks=0 logins=1" && verdict c PASS || verdict c FAIL
 }
 
@@ -211,7 +212,40 @@ t_k() {
     grep -q "otpuser via config: rc=0 whoami=otpuser" <<<"$out" && verdict k PASS || verdict k FAIL
 }
 
-for t in ${@:-a b c d e f g h i j k}; do "t_$t"; done
+t_l() {
+    echo "== l. killed full tunnel restores routing and DNS"
+    local out
+    docker exec rwtest-ocserv sh -c 'cp /etc/ocserv/groups/full /tmp/full-before-crash-test; printf "\ndns = 192.168.99.1\n" >> /etc/ocserv/groups/full'
+    # Root and tester share a token: use a step tester has not consumed.
+    sleep $((31 - $(date +%s) % 30))
+    out=$(r 'set -e
+        umask 077
+        rwth-vpn down >/dev/null
+        ip -4 route show default >/tmp/default-before-crash
+        cp /etc/resolv.conf /tmp/resolv-before-crash
+        rwth-vpn up </dev/null
+        test "$(stat -c %a /var/run/rwth-vpn/disconnect.env)" = 600
+        test "$(stat -c %a /var/run/rwth-vpn/openconnect.pid)" = 644
+        test "$(stat -c %a /var/run/rwth-vpn/state)" = 644
+        grep -q "nameserver 192.168.99.1" /etc/resolv.conf
+        ip -6 rule add pref 5281 lookup 7338
+        kill -KILL "$(cat /var/run/rwth-vpn/openconnect.pid)"
+        sleep 1
+        rwth-vpn down
+        ip -4 route show default >/tmp/default-after-crash
+        cmp /tmp/default-before-crash /tmp/default-after-crash
+        cmp /tmp/resolv-before-crash /etc/resolv.conf
+        ! ip -6 rule | grep -q "5281:"
+        test ! -e /var/run/rwth-vpn/disconnect.env
+        test ! -e /var/run/rwth-vpn/state
+        rwth-vpn down
+        echo "crash recovery OK"')
+    echo "$out"
+    docker exec rwtest-ocserv sh -c 'mv /tmp/full-before-crash-test /etc/ocserv/groups/full'
+    grep -q "crash recovery OK" <<<"$out" && verdict l PASS || verdict l FAIL
+}
+
+for t in ${@:-a b c d e f g h i j k l}; do "t_$t"; done
 echo "== summary"; printf '%s\n' "${RESULTS[@]}"
 for result in "${RESULTS[@]}"; do
     case "$result" in *" FAIL") exit 1;; esac
